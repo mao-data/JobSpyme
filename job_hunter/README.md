@@ -84,6 +84,7 @@ claude setup-token
 
 ## 要注意的事
 
+- **LinkedIn 429**：LinkedIn 只要請求太快就會回 429。所以 LinkedIn 每個州只搜一次（把所有職稱用 OR 合併），搜尋時不抓職缺描述；等州別和職稱篩選完，才慢慢抓剩下職缺的頁面（每頁間隔 5 到 9 秒）。遇到 429 會等 70 秒再試，連續 3 次被擋就先停，其餘的明天再說。這些都可以在 `config.yaml` 的 `sites.linkedin` 調整。
 - **網站封鎖**：GitHub Actions 的主機是資料中心 IP，LinkedIn 和 Glassdoor 可能會擋，Indeed 通常沒問題。Actions 的執行紀錄會顯示每個搜尋抓到幾筆。如果某個網站一直是 0 筆，可以在 `config.yaml` 拿掉它，或設定 `JOBSPY_PROXIES`。
 - **訂閱額度**：每 8 筆職缺用一次 Claude，再加上每封 cover letter 各一次。每天 60 筆大約是 10 到 20 次呼叫，會用掉訂閱的額度。
 - **Actions 執行時間**：一次可能要 30 到 60 分鐘，主要是在抓職缺描述。公開 repo 不限時數；私人 repo 每月有 2,000 分鐘免費額度。不夠用的話，減少 `search_terms` 或 `results_wanted`。

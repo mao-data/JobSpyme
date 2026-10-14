@@ -26,11 +26,24 @@ hours_old: 24
 # which is slower and more likely to get rate limited).
 sites:
   indeed:        {results_wanted: 50, fetch_description: false}
-  linkedin:      {results_wanted: 15, fetch_description: true}
-  zip_recruiter: {results_wanted: 25, fetch_description: true}
-  glassdoor:     {results_wanted: 25, fetch_description: true}
+  # LinkedIn returns 429 when hit fast, so it gets special handling:
+  # one OR query per state (combine_terms), no descriptions during the search, then
+  # descriptions fetched slowly only for jobs that pass the state/title filters.
+  linkedin:
+    results_wanted: 50
+    fetch_description: false
+    combine_terms: true
+    pause_seconds: 30          # between LinkedIn searches
+    slow_descriptions: true
+    max_descriptions: 80       # per run
+    detail_delay: [5, 9]       # seconds between job pages
+    backoff_seconds: 70        # wait after a 429, then retry once
+  # ZipRecruiter and Glassdoor answer 403 to every request from GitHub Actions
+  # servers. They can work from a home connection or through proxies:
+  # zip_recruiter: {results_wanted: 25, fetch_description: true}
+  # glassdoor:     {results_wanted: 25, fetch_description: true}
 
-# Seconds to wait between searches, to avoid 429 blocks.
+# Seconds to wait between searches, to avoid 429 blocks (a site can override it).
 pause_seconds: 5
 
 # Optional proxies, e.g. ["user:pass@host:port", "localhost"]
@@ -63,5 +76,6 @@ claude:
   batch_size: 8
   # Jobs scoring at least this (1-10) get a tailored cover letter + resume bullets.
   tailor_min_score: 8
-  # Most jobs sent to Claude per run (newest first), to bound usage.
-  max_jobs_scored: 60
+  # Most jobs sent to Claude per run (newest first), to bound usage. Jobs past
+  # the cap are still added to the sheet, unscored.
+  max_jobs_scored: 150
