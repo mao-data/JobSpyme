@@ -451,6 +451,7 @@ def main():
         # Without Claude the shortlist is left out, so a later full run still scores it.
         sheets.append_run(book, shortlist if use_claude else shortlist.iloc[0:0], excluded, today)
         print(f"Added {len(shortlist) if use_claude else 0} jobs and {len(excluded)} filtered-out rows to the Google Sheet")
+        sheets.tidy(book, today, cfg.get("sheet", {}))
 
     # Remember what we looked at, so tomorrow's run only shows new jobs. Without
     # Claude, the shortlist isn't remembered so a later full run still scores it.

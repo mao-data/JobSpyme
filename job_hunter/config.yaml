@@ -18,8 +18,9 @@ locations:
   - Texas
   - New Jersey
 
-# Only keep jobs posted within this many hours. 24 suits a daily run.
-hours_old: 24
+# Only keep jobs posted within this many hours. 48 overlaps the previous day's run,
+# so a missed or late run loses nothing; jobs already in the sheet are skipped.
+hours_old: 48
 
 # Per board: results per search, and whether to fetch each job page for the
 # description (Indeed includes it already; the others need the extra request,
@@ -62,6 +63,14 @@ h1b_sponsor_files: []
 # Google Sheet that each run adds new jobs to. Leave empty to only write Excel.
 # The sheet must be shared with the service account (see README).
 google_sheet_id: 151HhbH4f_HU-1IXApMNbLWr8nLH_yfalxkDjoN2TaE8
+
+sheet:
+  # 「今日精選」tab: jobs found in the last picks_days days, scoring at least
+  # picks_min_score, with no status yet. Delete the tab to have it rebuilt.
+  picks_min_score: 7
+  picks_days: 3
+  # Jobs rows with no status after this many days move to the Archive tab.
+  archive_after_days: 14
 
 claude:
   enabled: true
