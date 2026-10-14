@@ -46,10 +46,22 @@ filters:
 # sponsored H-1B before. See README for where to download it.
 h1b_sponsor_files: []
 
+# Google Sheet that each run adds new jobs to. Leave empty to only write Excel.
+# The sheet must be shared with the service account (see README).
+google_sheet_id: 151HhbH4f_HU-1IXApMNbLWr8nLH_yfalxkDjoN2TaE8
+
 claude:
   enabled: true
+  # claude_code: the `claude` CLI on your Claude Pro/Max subscription (no API key).
+  # api: the Anthropic API with ANTHROPIC_API_KEY, billed per token.
+  backend: claude_code
+  # Model for the claude_code backend: sonnet uses less of your subscription than opus.
+  cli_model: sonnet
+  # Model for the api backend.
   model: claude-opus-5-5
+  # Jobs per Claude call when scoring. Fewer calls = less subscription usage.
+  batch_size: 8
   # Jobs scoring at least this (1-10) get a tailored cover letter + resume bullets.
   tailor_min_score: 8
-  # Hard cap on how many jobs are sent to Claude per run, to bound cost.
-  max_jobs_scored: 150
+  # Most jobs sent to Claude per run (newest first), to bound usage.
+  max_jobs_scored: 60

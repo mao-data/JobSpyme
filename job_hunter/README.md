@@ -1,91 +1,103 @@
 # Job Hunter
 
-每天自動找美國職缺、排除不提供 H-1B 擔保的職缺，再用 Claude 依照你的履歷打分數，最後輸出一份 Excel 清單。分數高的職缺還會附上客製化履歷重點和 cover letter。
+每天在雲端（GitHub Actions）自動找美國職缺、排除不提供 H-1B 擔保的職缺，再用 Claude 依照你的履歷打分數，結果自動加進你的 Google Sheet。分數高的職缺還會附上客製化 cover letter。
 
-**它不會自動送出應徵**，送出前由你自己看過、自己按。
+評分用的是你的 **Claude Pro/Max 訂閱**（透過 Claude Code），不需要 API key。
 
 ```
-JobSpy 抓職缺 (Indeed / LinkedIn / ZipRecruiter / Glassdoor)
-  → 去除重複、去掉之前看過的
+每天 GitHub Actions 定時執行
+  → JobSpy 抓職缺 (Indeed / LinkedIn / ZipRecruiter / Glassdoor)
+  → 跳過 Google Sheet 裡已經有的職缺
   → 規則篩選：州別、職稱（排除 Senior/Manager…）、「不提供 sponsorship」
   → Claude 評分：契合度 1-10、再判斷一次 sponsorship、所需年資、缺少的技能
-  → 高分職缺：產生客製化 resume bullets + cover letter
-  → output/日期/jobs_日期.xlsx
+  → 高分職缺：產生 cover letter
+  → 新增到 Google Sheet：「Jobs」分頁放通過的職缺，「Filtered out」分頁放被排除的職缺和原因
 ```
 
-## 安裝
+## Google Sheet
 
-需要 Python 3.10 以上。
+每次執行只會**新增**列，不會改動舊的資料。
+
+- `status`、`notes` 欄是給你自己填的，例如「想投」「已投」「面試」。
+- 欄位順序可以自己調整，也可以加新欄位，程式會依第 1 列的欄名寫入。
+
+## 雲端設定（只要做一次）
+
+### 1. Claude 訂閱 token
+
+在你自己的電腦上執行：
 
 ```bash
-git clone https://github.com/mao-data/JobSpyme
-cd JobSpyme/job_hunter
-pip install -r requirements.txt
+npm install -g @anthropic-ai/claude-code
+claude setup-token
 ```
 
-1. 把你的履歷放到 `job_hunter/resume.pdf`。`.gitignore` 已經排除它，不會被推到 GitHub。
-2. 設定 Claude API key（到 https://platform.claude.com 申請）：
-   ```bash
-   export ANTHROPIC_API_KEY=sk-ant-...        # macOS / Linux
-   setx ANTHROPIC_API_KEY sk-ant-...          # Windows（設完要重開終端機）
-   ```
+它會讓你用 Claude 帳號登入，然後印出一組長效 token。
 
-## 使用
+### 2. Google 服務帳號（讓程式能寫入你的 Sheet）
 
-```bash
-python hunt.py              # 完整流程
-python hunt.py --no-claude  # 只抓和篩選，不呼叫 Claude（不花錢，適合先測試）
-```
+1. 打開 [Google Cloud Console](https://console.cloud.google.com/)，建立一個專案，名字隨意。
+2. 「API 和服務」→「程式庫」→ 搜尋 **Google Sheets API** → 啟用。
+3. 「IAM 與管理」→「服務帳號」→「建立服務帳號」，名字隨意，不需要指派角色。
+4. 點進剛建好的服務帳號 →「金鑰」→「新增金鑰」→ JSON。瀏覽器會下載一個 `.json` 檔。
+5. 打開那個 JSON，複製 `client_email` 的值（像 `xxx@xxx.iam.gserviceaccount.com`）。
+6. 打開 Google Sheet →「共用」→ 貼上這個 email，權限設為**編輯者**。
 
-結果在 `output/YYYY-MM-DD/`：
+### 3. 在 GitHub 設定 Secrets
 
-- `jobs_YYYY-MM-DD.xlsx`
-  - **Shortlist** 分頁：通過篩選的職缺，依分數排序，`job_url` 可以直接點
-  - **Filtered out** 分頁：被排除的職缺和原因，可以檢查有沒有誤判
-- `letters/`：分數 ≥ 8 的職缺各一份 `.md`，內有客製化 resume bullets 和 cover letter
+到 repo 的 **Settings → Secrets and variables → Actions → New repository secret**，新增：
 
-看過的職缺會記在 `data/seen_jobs.csv`，下次執行只會出現新職缺。想重看全部就刪掉這個檔案。
+| Secret 名稱 | 內容 |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | 步驟 1 得到的 token |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | 步驟 2 下載的 JSON 檔**完整內容** |
+| `RESUME_TEXT` | 你的履歷**純文字**（從 PDF 複製貼上即可） |
+| `JOBSPY_PROXIES`（選填） | proxy 清單，用逗號分隔，例如 `user:pass@host:port,user:pass@host2:port` |
+
+履歷用 Secret 存放，不會出現在 repo 裡。
+
+### 4. 第一次手動執行
+
+1. 到 repo 的 **Actions** 分頁。如果看到提示要啟用 workflows，按啟用。
+2. 左側點 **Job Hunter** → **Run workflow**。
+3. 第一次建議勾選 `no_claude`，只測試抓職缺和寫入 Sheet。成功後再不勾選跑一次完整流程。
+
+之後每天台灣時間晚上 10:17（美西早上約 7 點）會自動執行。要改時間，修改 `.github/workflows/job-hunter.yml` 的 `cron`（時間是 UTC）。
 
 ## 設定（config.yaml）
 
 | 設定 | 說明 |
 |---|---|
-| `search_terms` | 搜尋的職稱，預設依你的履歷挑了 7 個 |
-| `locations` | 目標州：California、Arizona、Texas、New Jersey |
+| `search_terms` | 搜尋的職稱 |
+| `locations` | 目標州 |
 | `hours_old` | 只要多少小時內刊登的；每天跑就設 24 |
 | `sites` | 每個網站抓幾筆、要不要抓完整職缺描述 |
 | `filters.exclude_title_words` | 職稱含這些字就排除 |
-| `filters.require_sponsorship` | 排除寫明不提供 sponsorship 的職缺 |
+| `google_sheet_id` | 要寫入的 Google Sheet（網址 `/d/` 和 `/edit` 之間那段） |
+| `claude.backend` | `claude_code` 用訂閱；`api` 用 API key |
+| `claude.cli_model` | `sonnet`（較省訂閱額度）或 `opus` |
+| `claude.batch_size` | 一次送幾筆職缺給 Claude 評分 |
+| `claude.max_jobs_scored` | 每次最多評幾筆 |
 | `claude.tailor_min_score` | 幾分以上才產生 cover letter |
-| `claude.max_jobs_scored` | 每次最多送幾筆給 Claude，用來控制費用 |
 
-## H-1B 擔保怎麼判斷
+改完 push 到 `main`，下一次執行就會套用。
 
-會經過三層判斷：
+## 要注意的事
 
-1. **規則篩選**：職缺描述出現 "unable to sponsor"、"without the need for sponsorship"、"must be a U.S. citizen"、"security clearance" 等字眼就直接排除。
-2. **Claude 再判斷**：Claude 會讀完整描述，回報 `sponsors` / `unclear` / `no_sponsorship`，並附上原文依據。`no_sponsorship` 的職缺會移到 Filtered out。
-3. **過去的 H-1B 紀錄（選用）**：多數職缺不會寫要不要 sponsor，這時「公司過去有沒有申請過 H-1B」是最好的參考。
-   - 到 USCIS 的 [H-1B Employer Data Hub](https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub) 下載近一兩年的資料檔，放到 `job_hunter/h1b/`
-   - 在 `config.yaml` 填上路徑：
-     ```yaml
-     h1b_sponsor_files: [h1b/fy2025.csv, h1b/fy2024.csv]
-     ```
-   - Excel 的 `h1b_approvals` 欄會顯示該公司過去的核准數。公司名稱是用模糊比對，少數公司可能對不到。
+- **網站封鎖**：GitHub Actions 的主機是資料中心 IP，LinkedIn 和 Glassdoor 可能會擋，Indeed 通常沒問題。Actions 的執行紀錄會顯示每個搜尋抓到幾筆。如果某個網站一直是 0 筆，可以在 `config.yaml` 拿掉它，或設定 `JOBSPY_PROXIES`。
+- **訂閱額度**：每 8 筆職缺用一次 Claude，再加上每封 cover letter 各一次。每天 60 筆大約是 10 到 20 次呼叫，會用掉訂閱的額度。
+- **Actions 執行時間**：一次可能要 30 到 60 分鐘，主要是在抓職缺描述。公開 repo 不限時數；私人 repo 每月有 2,000 分鐘免費額度。不夠用的話，減少 `search_terms` 或 `results_wanted`。
+- **排程暫停**：公開 repo 如果 60 天沒有任何 commit，GitHub 會自動停用排程，到 Actions 頁面重新啟用即可。
+- **H-1B 判斷**：先用規則找「不提供 sponsorship」等字眼，Claude 再判斷一次。多數職缺不會寫，所以 `unclear` 很常見，不代表不能投。想更準，可以下載 USCIS 的 [H-1B Employer Data Hub](https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub) 資料，放進 `job_hunter/h1b/`，再設定 `h1b_sponsor_files`。這個資料夾預設被 `.gitignore` 排除，要在雲端使用，得把這行從 `.gitignore` 拿掉再 commit。
 
-`unclear` 不代表不能投。沒寫的職缺很多，配合 `h1b_approvals` 一起看就好。
+## 在自己電腦上執行（選用）
 
-## 費用
+```bash
+cd job_hunter
+pip install -r requirements.txt
+# 履歷放成 job_hunter/resume.pdf；要寫入 Sheet 的話，先設定 GOOGLE_SERVICE_ACCOUNT_JSON 環境變數
+python hunt.py --no-claude   # 只抓和篩選
+python hunt.py               # 完整流程（需要先執行過 `claude` 並登入）
+```
 
-預設用 Claude Opus 5.5。每筆評分大約 3,000 個輸入 token、幾百個輸出 token。以每次 150 筆加 10 封 cover letter 估算，一次大約 **2–5 美元**。實際金額每次執行結束會印出來。想省錢可以：
-
-- 把 `max_jobs_scored` 調低
-- 把 `claude.model` 改成 `claude-sonnet-5-5`，或更便宜的 `claude-haiku-5-5`
-
-## 常見問題
-
-- **一直抓到 0 筆、出現 429 或 403**：被網站擋了。可以減少 `search_terms` 或 `results_wanted`、拉長 `pause_seconds`、晚點再跑，或設定 `proxies`。LinkedIn 最容易被擋。
-- **每天自動執行**：
-  - macOS / Linux 用 `crontab -e`，加一行 `0 8 * * * cd /path/to/JobSpyme/job_hunter && python hunt.py`
-  - Windows 用「工作排程器」
-- **想加減職稱或州**：直接改 `config.yaml`，不用改程式。
+本機執行也會輸出 `output/日期/jobs_日期.xlsx` 和 `letters/`。

@@ -3,7 +3,7 @@ score the rest against your resume with Claude, and write an Excel shortlist.
 
 Usage:
     python hunt.py                 # full run
-    python hunt.py --no-claude     # scrape + filter only, no API cost
+    python hunt.py --no-claude     # scrape + filter only, no Claude usage
     python hunt.py --config other.yaml
 """
 
@@ -11,23 +11,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
-import anthropic
 import pandas as pd
 import yaml
 from jobspy import scrape_jobs
+
+from llm import LLMError, make_llm
 
 HERE = Path(__file__).resolve().parent
 SEEN_FILE = HERE / "data" / "seen_jobs.csv"
 OUTPUT_DIR = HERE / "output"
 
-# Opus 5.5 list price, USD per million tokens, for the end-of-run estimate.
-PRICE_IN, PRICE_OUT = 4.00, 20.00
 
 US_STATES = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
@@ -73,6 +73,9 @@ def load_config(path: Path) -> dict:
 
 
 def read_resume(path: Path) -> str:
+    # In the cloud the resume comes from a secret instead of a file in the repo.
+    if os.environ.get("RESUME_TEXT"):
+        return os.environ["RESUME_TEXT"].strip()
     if not path.exists():
         raise SystemExit(f"Resume not found: {path}. Put your resume there or change resume_path in config.yaml.")
     if path.suffix.lower() == ".pdf":
@@ -85,6 +88,7 @@ def read_resume(path: Path) -> str:
 
 def scrape(cfg: dict) -> pd.DataFrame:
     frames = []
+    proxies = cfg.get("proxies") or [p.strip() for p in os.environ.get("JOBSPY_PROXIES", "").split(",") if p.strip()]
     searches = [
         (site, opts, term, loc)
         for site, opts in cfg["sites"].items()
@@ -102,7 +106,7 @@ def scrape(cfg: dict) -> pd.DataFrame:
                 hours_old=cfg.get("hours_old"),
                 results_wanted=opts.get("results_wanted", 25),
                 fetch_description=opts.get("fetch_description", False),
-                proxies=cfg.get("proxies") or None,
+                proxies=proxies or None,
                 verbose=0,
             )
         except Exception as e:  # one bad board/search shouldn't kill the run
@@ -212,9 +216,10 @@ def apply_filters(df: pd.DataFrame, cfg: dict, seen: set[str], sponsors: dict[st
 
 # ---------- Claude ----------
 
-SCORE_SCHEMA = {
+SCORE_ITEM = {
     "type": "object",
     "properties": {
+        "id": {"type": "integer", "description": "the posting's id"},
         "fit_score": {"type": "integer", "description": "1-10, how well the candidate fits"},
         "sponsorship": {"type": "string", "enum": ["sponsors", "unclear", "no_sponsorship"]},
         "sponsorship_evidence": {"type": "string"},
@@ -223,8 +228,14 @@ SCORE_SCHEMA = {
         "matched_skills": {"type": "array", "items": {"type": "string"}},
         "missing_skills": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["fit_score", "sponsorship", "sponsorship_evidence", "years_required",
+    "required": ["id", "fit_score", "sponsorship", "sponsorship_evidence", "years_required",
                  "summary_zh", "matched_skills", "missing_skills"],
+    "additionalProperties": False,
+}
+SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {"results": {"type": "array", "items": SCORE_ITEM}},
+    "required": ["results"],
     "additionalProperties": False,
 }
 
@@ -239,7 +250,8 @@ TAILOR_SCHEMA = {
 }
 
 SYSTEM = """You help a job seeker in the United States triage job postings.
-The candidate needs H-1B visa sponsorship. Judge each posting against the resume below.
+The candidate is on F-1 STEM OPT and will need H-1B visa sponsorship. Judge each posting
+against the resume below.
 
 Scoring guide for fit_score:
 - 9-10: role, skills and seniority match closely; strong chance of an interview
@@ -270,43 +282,6 @@ cover_letter: a concise cover letter (under 250 words), plain text, no placehold
 </posting>"""
 
 
-class Claude:
-    def __init__(self, cfg: dict, resume: str):
-        self.client = anthropic.Anthropic(max_retries=4)
-        self.model = cfg["model"]
-        self.system = SYSTEM.replace("{resume}", resume)
-        self.tokens_in = self.tokens_out = 0
-
-    def _ask(self, prompt: str, schema: dict, effort: str, max_tokens: int) -> dict:
-        response = self.client.beta.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            system=self.system,
-            cache_control={"type": "ephemeral"},
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-        u = response.usage
-        self.tokens_in += (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
-        self.tokens_out += u.output_tokens or 0
-        if response.stop_reason == "refusal":
-            raise RuntimeError("Claude declined this posting")
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError("response cut off at max_tokens")
-        return json.loads(next(b.text for b in response.content if b.type == "text"))
-
-    def score(self, posting: str) -> dict:
-        return self._ask(f"Evaluate this posting.\n\n<posting>\n{posting}\n</posting>", SCORE_SCHEMA, "low", 4000)
-
-    def tailor(self, posting: str) -> dict:
-        return self._ask(TAILOR_PROMPT.replace("{posting}", posting), TAILOR_SCHEMA, "medium", 8000)
-
-    def cost(self) -> float:
-        return self.tokens_in / 1e6 * PRICE_IN + self.tokens_out / 1e6 * PRICE_OUT
-
-
 def posting_text(r) -> str:
     return (
         f"Title: {r['title']}\nCompany: {r['company']}\nLocation: {r['location']}\n"
@@ -314,52 +289,63 @@ def posting_text(r) -> str:
     )
 
 
+def score_batch(llm, batch: list[tuple[int, str]]) -> dict[int, dict]:
+    postings = "\n\n".join(f'<posting id="{i}">\n{text}\n</posting>' for i, text in batch)
+    prompt = f"Evaluate each of these {len(batch)} postings. Return one result per posting id.\n\n{postings}"
+    try:
+        results = llm.ask(prompt, SCORE_SCHEMA, effort="low")["results"]
+    except (LLMError, json.JSONDecodeError, KeyError, StopIteration) as e:
+        return {i: {"error": str(e)} for i, _ in batch}
+    by_id = {r["id"]: r for r in results}
+    return {i: by_id.get(i, {"error": "missing from Claude's reply"}) for i, _ in batch}
+
+
 def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
     """Returns (scored shortlist, jobs Claude found won't sponsor)."""
     ccfg = cfg["claude"]
-    claude = Claude(ccfg, resume)
-    limit = ccfg.get("max_jobs_scored", 150)
+    llm = make_llm(ccfg, SYSTEM.replace("{resume}", resume))
+    limit = ccfg.get("max_jobs_scored", 50)
     if len(df) > limit:
         # The rest stay unseen, so the next run picks them up.
         print(f"{len(df)} jobs passed the filters; scoring the {limit} newest (max_jobs_scored).")
         df = df.sort_values("date_posted", ascending=False, na_position="last").head(limit)
-    df = df.copy()
-    rows = [r for _, r in df.iterrows()]
+    df = df.reset_index(drop=True)
 
-    def score_one(r):
-        try:
-            return claude.score(posting_text(r))
-        except (anthropic.APIError, RuntimeError, json.JSONDecodeError, StopIteration) as e:
-            return {"error": str(e)}
+    size = ccfg.get("batch_size", 8)
+    items = [(i, posting_text(r)) for i, r in df.iterrows()]
+    batches = [items[k:k + size] for k in range(0, len(items), size)]
+    print(f"Scoring {len(items)} jobs in {len(batches)} batches...")
+    results: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for part in pool.map(lambda b: score_batch(llm, b), batches):
+            results.update(part)
+    res = [results[i] for i in df.index]
 
-    print(f"Scoring {len(rows)} jobs with {claude.model}...")
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(score_one, rows))
-
-    df["fit_score"] = [res.get("fit_score") for res in results]
-    df["ai_sponsorship"] = [res.get("sponsorship", "") for res in results]
-    df["ai_sponsorship_evidence"] = [res.get("sponsorship_evidence", "") for res in results]
-    df["years_required"] = [res.get("years_required") for res in results]
-    df["summary_zh"] = [res.get("summary_zh") or res.get("error", "") for res in results]
-    df["matched_skills"] = [", ".join(res.get("matched_skills", [])) for res in results]
-    df["missing_skills"] = [", ".join(res.get("missing_skills", [])) for res in results]
+    df["fit_score"] = [r.get("fit_score") for r in res]
+    df["ai_sponsorship"] = [r.get("sponsorship", "") for r in res]
+    df["ai_sponsorship_evidence"] = [r.get("sponsorship_evidence", "") for r in res]
+    df["years_required"] = [r.get("years_required") for r in res]
+    df["summary_zh"] = [r.get("summary_zh") or r.get("error", "") for r in res]
+    df["matched_skills"] = [", ".join(r.get("matched_skills", [])) for r in res]
+    df["missing_skills"] = [", ".join(r.get("missing_skills", [])) for r in res]
 
     dropped = df.iloc[0:0]
     if cfg.get("filters", {}).get("require_sponsorship", True):
         no_visa = df["ai_sponsorship"] == "no_sponsorship"
         dropped = df[no_visa].assign(excluded_reason="Claude: no visa sponsorship",
                                      visa_evidence=df.loc[no_visa, "ai_sponsorship_evidence"])
-        df = df[~no_visa]
+        df = df[~no_visa].copy()
 
     top = df[df["fit_score"].fillna(0) >= ccfg.get("tailor_min_score", 8)]
     df["letter_file"] = ""
+    df["cover_letter"] = ""
     if not top.empty:
         letters_dir.mkdir(parents=True, exist_ok=True)
         print(f"Writing tailored material for {len(top)} top jobs...")
         for idx, r in top.iterrows():
             try:
-                t = claude.tailor(posting_text(r))
-            except (anthropic.APIError, RuntimeError, json.JSONDecodeError, StopIteration) as e:
+                t = llm.ask(TAILOR_PROMPT.replace("{posting}", posting_text(r)), TAILOR_SCHEMA, effort="medium")
+            except (LLMError, json.JSONDecodeError, StopIteration) as e:
                 print(f"    {r['company']} - {r['title']}: {e}")
                 continue
             name = re.sub(r"[^\w-]+", "_", f"{r['company']}_{r['title']}")[:80] + ".md"
@@ -370,8 +356,9 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
                 encoding="utf-8",
             )
             df.at[idx, "letter_file"] = f"letters/{name}"
+            df.at[idx, "cover_letter"] = t["cover_letter"]
 
-    print(f"Claude usage: {claude.tokens_in:,} in / {claude.tokens_out:,} out tokens, about ${claude.cost():.2f}")
+    print(llm.usage_note())
     return df.sort_values("fit_score", ascending=False, na_position="last"), dropped
 
 
@@ -418,6 +405,12 @@ def main():
     resume = read_resume(HERE / cfg["resume_path"]) if use_claude else ""
 
     seen = set(pd.read_csv(SEEN_FILE)["key"]) if SEEN_FILE.exists() else set()
+    sheet_id = cfg.get("google_sheet_id") or os.environ.get("GOOGLE_SHEET_ID")
+    book = None
+    if sheet_id:
+        import sheets
+        book = sheets.connect(sheet_id)
+        seen |= sheets.known_keys(book)
     sponsors = load_h1b_sponsors(cfg.get("h1b_sponsor_files") or [])
 
     raw = scrape(cfg)
@@ -435,6 +428,10 @@ def main():
 
     out = run_dir / f"jobs_{today}.xlsx"
     write_excel(out, shortlist, excluded)
+    if book is not None:
+        # Without Claude the shortlist is left out, so a later full run still scores it.
+        sheets.append_run(book, shortlist if use_claude else shortlist.iloc[0:0], excluded, today)
+        print(f"Added {len(shortlist) if use_claude else 0} jobs and {len(excluded)} filtered-out rows to the Google Sheet")
 
     # Remember what we looked at, so tomorrow's run only shows new jobs. Without
     # Claude, the shortlist isn't remembered so a later full run still scores it.
