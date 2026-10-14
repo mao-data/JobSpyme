@@ -1,0 +1,6 @@
+python-jobspy>=1.3.0
+anthropic>=1.13.0
+pandas
+openpyxl
+pypdf
+pyyaml

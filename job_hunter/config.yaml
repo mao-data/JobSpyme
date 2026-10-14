@@ -1,0 +1,55 @@
+# Job Hunter settings. Edit freely; every run reads this file.
+
+# Your resume (PDF or .txt). Kept out of git by .gitignore.
+resume_path: resume.pdf
+
+search_terms:
+  - Data Analyst
+  - Business Analyst
+  - Operations Analyst
+  - Logistics Analyst
+  - Supply Chain Analyst
+  - Business Intelligence Analyst
+  - Technical Support Engineer
+
+locations:
+  - California
+  - Arizona
+  - Texas
+  - New Jersey
+
+# Only keep jobs posted within this many hours. 24 suits a daily run.
+hours_old: 24
+
+# Per board: results per search, and whether to fetch each job page for the
+# description (Indeed includes it already; the others need the extra request,
+# which is slower and more likely to get rate limited).
+sites:
+  indeed:        {results_wanted: 50, fetch_description: false}
+  linkedin:      {results_wanted: 15, fetch_description: true}
+  zip_recruiter: {results_wanted: 25, fetch_description: true}
+  glassdoor:     {results_wanted: 25, fetch_description: true}
+
+# Seconds to wait between searches, to avoid 429 blocks.
+pause_seconds: 5
+
+# Optional proxies, e.g. ["user:pass@host:port", "localhost"]
+proxies: []
+
+filters:
+  # Drop jobs whose title contains any of these words (case-insensitive).
+  exclude_title_words: [senior, sr, lead, principal, staff, manager, director, head, vp, chief, intern]
+  # Drop jobs whose description says it won't sponsor a visa. Keep true for H-1B.
+  require_sponsorship: true
+
+# Optional: USCIS H-1B Employer Data Hub CSV(s), used to tag companies that
+# sponsored H-1B before. See README for where to download it.
+h1b_sponsor_files: []
+
+claude:
+  enabled: true
+  model: claude-opus-5-5
+  # Jobs scoring at least this (1-10) get a tailored cover letter + resume bullets.
+  tailor_min_score: 8
+  # Hard cap on how many jobs are sent to Claude per run, to bound cost.
+  max_jobs_scored: 150

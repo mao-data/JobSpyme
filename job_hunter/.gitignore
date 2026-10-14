@@ -1,0 +1,6 @@
+# Personal data: never commit
+resume.*
+*.pdf
+output/
+data/
+h1b/
