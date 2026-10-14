@@ -38,12 +38,16 @@ sites:
     slow_descriptions: true
     max_descriptions: 80       # per run
     detail_delay: [5, 9]       # seconds between job pages
-    backoff_seconds: 70        # wait after a 429, then retry once
+    backoff_seconds: 70        # wait after a 429 on a job page before trying again
+    retry_waits: [60, 120]     # waits between the 3 tries of a failed search
   # ZipRecruiter and Glassdoor answer 403 to every request from GitHub Actions
   # servers. They can work from a home connection or through proxies:
   # zip_recruiter: {results_wanted: 25, fetch_description: true}
   # glassdoor:     {results_wanted: 25, fetch_description: true}
 
+# Every search, Claude call and Google Sheet write gets up to 3 tries. A site whose
+# searches fail 3 times in a row is skipped for the rest of the run. Failures are
+# listed at the end of the log, on the Actions run page, and in the sheet's Run log tab.
 # Seconds to wait between searches, to avoid 429 blocks (a site can override it).
 pause_seconds: 5
 

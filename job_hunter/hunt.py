@@ -10,9 +10,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -23,11 +23,15 @@ import yaml
 from jobspy import scrape_jobs
 
 from linkedin_details import fill_descriptions as fill_li
-from llm import LLMError, make_llm
+from llm import make_llm
+from runlog import RunLog, StepFailed, jobspy_errors
 
 HERE = Path(__file__).resolve().parent
 SEEN_FILE = HERE / "data" / "seen_jobs.csv"
 OUTPUT_DIR = HERE / "output"
+
+# Retries (3 tries per step) and the record of what failed, shared by the whole run.
+RUN = RunLog()
 
 
 US_STATES = {
@@ -101,26 +105,44 @@ def scrape(cfg: dict) -> pd.DataFrame:
         terms = ([" OR ".join(f'"{t}"' for t in cfg["search_terms"])]
                  if opts.get("combine_terms") else cfg["search_terms"])
         searches += [(site, opts, term, loc) for term in terms for loc in cfg["locations"]]
+    failed_in_a_row: dict[str, int] = {}
     for i, (site, opts, term, loc) in enumerate(searches, 1):
-        print(f"[{i}/{len(searches)}] {site}: {term} @ {loc}", flush=True)
-        try:
-            df = scrape_jobs(
-                site_name=[site],
-                search_term=term,
-                location=loc,
-                country_indeed="USA",
-                hours_old=cfg.get("hours_old"),
-                results_wanted=opts.get("results_wanted", 25),
-                fetch_description=opts.get("fetch_description", False),
-                proxies=proxies or None,
-                verbose=0,
-            )
-        except Exception as e:  # one bad board/search shouldn't kill the run
-            print(f"    failed: {e}")
+        step = f"{site}: {term} @ {loc}"
+        if failed_in_a_row.get(site, 0) >= 3:
+            continue  # this site is blocking us today; reported once below
+        print(f"[{i}/{len(searches)}] {step}", flush=True)
+
+        def search():
+            with jobspy_errors() as errors:
+                df = scrape_jobs(
+                    site_name=[site],
+                    search_term=term,
+                    location=loc,
+                    country_indeed="USA",
+                    hours_old=cfg.get("hours_old"),
+                    results_wanted=opts.get("results_wanted", 25),
+                    fetch_description=opts.get("fetch_description", False),
+                    proxies=proxies or None,
+                    verbose=0,
+                )
+            if errors and df.empty:
+                raise StepFailed("; ".join(dict.fromkeys(errors)))
+            if errors:
+                RUN.warn(f"{step}: kept {len(df)} jobs, but the board also returned: {errors[0]}")
+            return df
+
+        df = RUN.attempt(step, search, waits=tuple(opts.get("retry_waits", (15, 60))))
+        if df is None:
+            failed_in_a_row[site] = failed_in_a_row.get(site, 0) + 1
+            if failed_in_a_row[site] == 3:
+                RUN.warn(f"{site}: 3 searches in a row failed after retries; skipped its remaining searches this run")
             df = pd.DataFrame()
+        else:
+            failed_in_a_row[site] = 0
         if not df.empty:
             df["search_term"] = term
             frames.append(df)
+        RUN.count(f"site_{site}", len(df))
         print(f"    {len(df)} jobs", flush=True)
         time.sleep(opts.get("pause_seconds", cfg.get("pause_seconds", 5)))
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -215,7 +237,7 @@ def apply_filters(df: pd.DataFrame, cfg: dict, seen: set[str], sponsors: dict[st
     if li_opts.get("slow_descriptions") and len(df):
         need = df[(df["site"] == "linkedin") & (df["excluded_reason"] == "") & df["description"].isna()]
         if len(need):
-            texts = fill_li(list(need["job_url"]), li_opts, get_proxies(cfg))
+            texts = fill_li(list(need["job_url"]), li_opts, get_proxies(cfg), log=RUN)
             df["description"] = df["description"].where(df["description"].notna(), df["job_url"].map(texts))
 
     status = df["description"].map(visa_status)
@@ -306,12 +328,20 @@ def posting_text(r) -> str:
 def score_batch(llm, batch: list[tuple[int, str]]) -> dict[int, dict]:
     postings = "\n\n".join(f'<posting id="{i}">\n{text}\n</posting>' for i, text in batch)
     prompt = f"Evaluate each of these {len(batch)} postings. Return one result per posting id.\n\n{postings}"
-    try:
+    ids = [i for i, _ in batch]
+
+    def ask():
         results = llm.ask(prompt, SCORE_SCHEMA, effort="low")["results"]
-    except (LLMError, json.JSONDecodeError, KeyError, StopIteration) as e:
-        return {i: {"error": str(e)} for i, _ in batch}
-    by_id = {r["id"]: r for r in results}
-    return {i: by_id.get(i, {"error": "missing from Claude's reply"}) for i, _ in batch}
+        by_id = {r["id"]: r for r in results}
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise StepFailed(f"reply left out {len(missing)} of {len(ids)} postings")
+        return by_id
+
+    by_id = RUN.attempt(f"Claude scoring, postings {ids[0]}-{ids[-1]}", ask, waits=(20, 60))
+    if by_id is None:
+        return {i: {"error": "Claude scoring failed after 3 tries"} for i in ids}
+    return {i: by_id[i] for i in ids}
 
 
 def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
@@ -361,10 +391,11 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
         letters_dir.mkdir(parents=True, exist_ok=True)
         print(f"Writing tailored material for {len(top)} top jobs...")
         for idx, r in top.iterrows():
-            try:
-                t = llm.ask(TAILOR_PROMPT.replace("{posting}", posting_text(r)), TAILOR_SCHEMA, effort="medium")
-            except (LLMError, json.JSONDecodeError, StopIteration) as e:
-                print(f"    {r['company']} - {r['title']}: {e}")
+            t = RUN.attempt(f"Claude cover letter: {r['company']} - {r['title']}",
+                            lambda: llm.ask(TAILOR_PROMPT.replace("{posting}", posting_text(r)),
+                                            TAILOR_SCHEMA, effort="medium"),
+                            waits=(20, 60))
+            if t is None:
                 continue
             name = re.sub(r"[^\w-]+", "_", f"{r['company']}_{r['title']}")[:80] + ".md"
             (letters_dir / name).write_text(
@@ -377,6 +408,7 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
             df.at[idx, "cover_letter"] = t["cover_letter"]
 
     print(llm.usage_note())
+    RUN.count("scored", int(df["fit_score"].notna().sum()))
     df = pd.concat([df, overflow], ignore_index=True)
     return df.sort_values("fit_score", ascending=False, na_position="last"), dropped
 
@@ -428,14 +460,18 @@ def main():
     book = None
     if sheet_id:
         import sheets
-        book = sheets.connect(sheet_id)
-        seen |= sheets.known_keys(book)
+        book = RUN.attempt("Google Sheet: connect", lambda: sheets.connect(sheet_id))
+        keys = RUN.attempt("Google Sheet: read existing jobs", lambda: sheets.known_keys(book)) if book else None
+        if keys is None:
+            # Without the sheet's keys every job would be added again as new.
+            finish(None, exit_code=1, note="Stopped: couldn't read the Google Sheet, so nothing was scraped.")
+        seen |= keys
     sponsors = load_h1b_sponsors(cfg.get("h1b_sponsor_files") or [])
 
     raw = scrape(cfg)
+    RUN.count("scraped", len(raw))
     if raw.empty:
-        print("No jobs found. Boards may be blocking you (try later, fewer searches, or proxies).")
-        return
+        finish(book, exit_code=1, note="No jobs found. Boards may be blocking us (see the failures above).")
     shortlist, excluded = apply_filters(raw, cfg, seen, sponsors)
     print(f"Scraped {len(raw)}, new and passing filters: {len(shortlist)}, filtered out: {len(excluded)}")
 
@@ -447,11 +483,19 @@ def main():
 
     out = run_dir / f"jobs_{today}.xlsx"
     write_excel(out, shortlist, excluded)
+    print(f"Excel copy: {out}")
+    exit_code = 0
     if book is not None:
         # Without Claude the shortlist is left out, so a later full run still scores it.
-        sheets.append_run(book, shortlist if use_claude else shortlist.iloc[0:0], excluded, today)
-        print(f"Added {len(shortlist) if use_claude else 0} jobs and {len(excluded)} filtered-out rows to the Google Sheet")
-        sheets.tidy(book, today, cfg.get("sheet", {}))
+        to_add = shortlist if use_claude else shortlist.iloc[0:0]
+        ok_jobs = RUN.attempt("Google Sheet: add jobs", lambda: sheets.append_tab(book, sheets.JOBS_TAB, to_add, today))
+        ok_filtered = RUN.attempt("Google Sheet: add filtered-out rows",
+                                  lambda: sheets.append_tab(book, sheets.FILTERED_TAB, excluded, today))
+        if ok_jobs is not None:
+            RUN.count("jobs_added", len(to_add))
+        if ok_jobs is None or ok_filtered is None:
+            exit_code = 1  # GitHub emails you when a run fails
+        sheets.tidy(book, today, cfg.get("sheet", {}), warn=RUN.warn)
 
     # Remember what we looked at, so tomorrow's run only shows new jobs. Without
     # Claude, the shortlist isn't remembered so a later full run still scores it.
@@ -460,8 +504,20 @@ def main():
     new_seen = pd.concat(looked_at)[["key", "title", "company", "job_url"]]
     new_seen["first_seen"] = today
     new_seen.to_csv(SEEN_FILE, mode="a", header=not SEEN_FILE.exists(), index=False)
+    finish(book, exit_code)
 
-    print(f"Done: {out}")
+
+def finish(book, exit_code: int = 0, note: str = "") -> None:
+    """Print the run log, put it on the Actions page and the sheet's Run log tab, and exit."""
+    if note:
+        RUN.warn(note)
+    RUN.print_summary()
+    RUN.write_github_summary()
+    if book is not None:
+        import sheets
+        if RUN.attempt("Google Sheet: write run log", lambda: sheets.append_runlog(book, RUN.sheet_row())) is None:
+            print("Couldn't write the Run log tab; the summary above is the record.")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -107,15 +107,35 @@ def _rows(df: pd.DataFrame, header: list[str], today: str) -> list[list]:
     return rows
 
 
+def append_tab(book: gspread.Spreadsheet, title: str, df: pd.DataFrame, today: str) -> bool:
+    """Add one run's rows to the Jobs or Filtered out tab. One tab per call, so a
+    retry after a failure never adds the other tab's rows twice."""
+    if df.empty:
+        return True
+    columns, first = {JOBS_TAB: (JOBS_COLUMNS, True), FILTERED_TAB: (FILTERED_COLUMNS, False)}[title]
+    ws = _tab(book, title, columns, first)
+    # Follow the sheet's own column order, so you can rearrange or add columns.
+    header = ws.row_values(1)
+    ws.append_rows(_rows(df, header, today), value_input_option="RAW")
+    return True
+
+
 def append_run(book: gspread.Spreadsheet, shortlist: pd.DataFrame, excluded: pd.DataFrame, today: str) -> None:
-    for title, columns, first, df in ((JOBS_TAB, JOBS_COLUMNS, True, shortlist),
-                                      (FILTERED_TAB, FILTERED_COLUMNS, False, excluded)):
-        if df.empty:
-            continue
-        ws = _tab(book, title, columns, first)
-        # Follow the sheet's own column order, so you can rearrange or add columns.
-        header = ws.row_values(1)
-        ws.append_rows(_rows(df, header, today), value_input_option="RAW")
+    append_tab(book, JOBS_TAB, shortlist, today)
+    append_tab(book, FILTERED_TAB, excluded, today)
+
+
+RUNLOG_TAB = "Run log"
+RUNLOG_COLUMNS = ["run_time", "status", "minutes", "scraped", "new_jobs", "scored", "failed_steps",
+                  "retried_ok", "details", "per_site", "run_url"]
+
+
+def append_runlog(book: gspread.Spreadsheet, row: dict) -> bool:
+    """One row per run: what ran, what failed after retries, and a link to the full log."""
+    ws = _tab(book, RUNLOG_TAB, RUNLOG_COLUMNS)
+    header = ws.row_values(1)
+    ws.append_rows([[_cell(row.get(c, "")) for c in header]], value_input_option="RAW")
+    return True
 
 
 # ---------- tidy-up: status dropdown, colours, today's picks, archive ----------
@@ -233,7 +253,7 @@ def archive_old(book: gspread.Spreadsheet, today: str, days: int) -> int:
     return len(old)
 
 
-def tidy(book: gspread.Spreadsheet, today: str, cfg: dict) -> None:
+def tidy(book: gspread.Spreadsheet, today: str, cfg: dict, warn=print) -> None:
     """Optional sheet niceties. A failure here is reported but never stops the run."""
     steps = [
         ("status dropdown and colours", lambda: setup_jobs_tab(book)),
@@ -244,4 +264,4 @@ def tidy(book: gspread.Spreadsheet, today: str, cfg: dict) -> None:
         try:
             step()
         except Exception as e:  # formatting must never cost a day's jobs
-            print(f"Sheet {name} skipped: {e}")
+            warn(f"Google Sheet {name} skipped: {e}")
