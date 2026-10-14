@@ -318,11 +318,15 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
     """Returns (scored shortlist, jobs Claude found won't sponsor)."""
     ccfg = cfg["claude"]
     llm = make_llm(ccfg, SYSTEM.replace("{resume}", resume))
-    limit = ccfg.get("max_jobs_scored", 50)
+    limit = ccfg.get("max_jobs_scored", 150)
+    overflow = df.iloc[0:0]
     if len(df) > limit:
-        # The rest stay unseen, so the next run picks them up.
+        # Jobs past the cap still go to the sheet, unscored: the search only covers
+        # recent postings, so a job skipped today would never come back.
         print(f"{len(df)} jobs passed the filters; scoring the {limit} newest (max_jobs_scored).")
-        df = df.sort_values("date_posted", ascending=False, na_position="last").head(limit)
+        df = df.sort_values("date_posted", ascending=False, na_position="last")
+        overflow = df.iloc[limit:].assign(summary_zh="未評分：超過每次評分上限 (max_jobs_scored)")
+        df = df.iloc[:limit]
     df = df.reset_index(drop=True)
 
     size = ccfg.get("batch_size", 8)
@@ -373,6 +377,7 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
             df.at[idx, "cover_letter"] = t["cover_letter"]
 
     print(llm.usage_note())
+    df = pd.concat([df, overflow], ignore_index=True)
     return df.sort_values("fit_score", ascending=False, na_position="last"), dropped
 
 
