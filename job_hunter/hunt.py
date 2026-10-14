@@ -22,6 +22,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
+from linkedin_details import fill_descriptions as fill_li
 from llm import LLMError, make_llm
 
 HERE = Path(__file__).resolve().parent
@@ -86,15 +87,20 @@ def read_resume(path: Path) -> str:
 
 # ---------- scrape ----------
 
+def get_proxies(cfg: dict) -> list[str]:
+    return cfg.get("proxies") or [p.strip() for p in os.environ.get("JOBSPY_PROXIES", "").split(",") if p.strip()]
+
+
 def scrape(cfg: dict) -> pd.DataFrame:
     frames = []
-    proxies = cfg.get("proxies") or [p.strip() for p in os.environ.get("JOBSPY_PROXIES", "").split(",") if p.strip()]
-    searches = [
-        (site, opts, term, loc)
-        for site, opts in cfg["sites"].items()
-        for term in cfg["search_terms"]
-        for loc in cfg["locations"]
-    ]
+    proxies = get_proxies(cfg)
+    searches = []
+    for site, opts in cfg["sites"].items():
+        # combine_terms: one OR query per location instead of one search per term,
+        # for boards (LinkedIn) that block after many requests.
+        terms = ([" OR ".join(f'"{t}"' for t in cfg["search_terms"])]
+                 if opts.get("combine_terms") else cfg["search_terms"])
+        searches += [(site, opts, term, loc) for term in terms for loc in cfg["locations"]]
     for i, (site, opts, term, loc) in enumerate(searches, 1):
         print(f"[{i}/{len(searches)}] {site}: {term} @ {loc}", flush=True)
         try:
@@ -115,8 +121,8 @@ def scrape(cfg: dict) -> pd.DataFrame:
         if not df.empty:
             df["search_term"] = term
             frames.append(df)
-            print(f"    {len(df)} jobs")
-        time.sleep(cfg.get("pause_seconds", 5))
+        print(f"    {len(df)} jobs", flush=True)
+        time.sleep(opts.get("pause_seconds", cfg.get("pause_seconds", 5)))
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -192,25 +198,33 @@ def apply_filters(df: pd.DataFrame, cfg: dict, seen: set[str], sponsors: dict[st
     df = df.drop_duplicates(subset="job_url").drop_duplicates(subset="key")
     df = df[~df["key"].isin(seen)]
 
+    words = [w.lower() for w in f.get("exclude_title_words", [])]
+    title_re = re.compile(r"\b(" + "|".join(map(re.escape, words)) + r")\b", re.I) if words else None
+
+    def cheap_reason(r) -> str:
+        if not in_target_states(r["location"], r.get("is_remote"), cfg["locations"]):
+            return "outside target states"
+        if title_re and title_re.search(str(r["title"])):
+            return "title too senior / excluded word"
+        return ""
+
+    df["excluded_reason"] = [cheap_reason(r) for _, r in df.iterrows()] if len(df) else []
+
+    # LinkedIn descriptions are fetched here, slowly, and only for jobs that survived.
+    li_opts = cfg.get("sites", {}).get("linkedin", {})
+    if li_opts.get("slow_descriptions") and len(df):
+        need = df[(df["site"] == "linkedin") & (df["excluded_reason"] == "") & df["description"].isna()]
+        if len(need):
+            texts = fill_li(list(need["job_url"]), li_opts, get_proxies(cfg))
+            df["description"] = df["description"].where(df["description"].notna(), df["job_url"].map(texts))
+
     status = df["description"].map(visa_status)
     df["visa_rule"] = status.map(lambda t: t[0])
     df["visa_evidence"] = status.map(lambda t: t[1])
     df["h1b_approvals"] = df["company"].map(lambda c: sponsors.get(normalize_company(c))) if sponsors else None
-
-    words = [w.lower() for w in f.get("exclude_title_words", [])]
-    title_re = re.compile(r"\b(" + "|".join(map(re.escape, words)) + r")\b", re.I) if words else None
-
-    reasons = []
-    for _, r in df.iterrows():
-        if not in_target_states(r["location"], r.get("is_remote"), cfg["locations"]):
-            reasons.append("outside target states")
-        elif title_re and title_re.search(str(r["title"])):
-            reasons.append("title too senior / excluded word")
-        elif f.get("require_sponsorship", True) and r["visa_rule"] == "no_sponsorship":
-            reasons.append("says no visa sponsorship")
-        else:
-            reasons.append("")
-    df["excluded_reason"] = reasons
+    no_visa = (df["excluded_reason"] == "") & (df["visa_rule"] == "no_sponsorship")
+    if f.get("require_sponsorship", True):
+        df.loc[no_visa, "excluded_reason"] = "says no visa sponsorship"
     return df[df["excluded_reason"] == ""].copy(), df[df["excluded_reason"] != ""].copy()
 
 
