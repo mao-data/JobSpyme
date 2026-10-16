@@ -253,6 +253,30 @@ def archive_old(book: gspread.Spreadsheet, today: str, days: int) -> int:
     return len(old)
 
 
+def sort_newest_first(book: gspread.Spreadsheet) -> None:
+    """Sort Jobs and Filtered out by date_found, newest first; within a day by score
+    (Jobs). Whole rows move together, so your status and notes stay with their job."""
+    meta = book.fetch_sheet_metadata(params={"fields": "sheets(properties(sheetId,title,gridProperties))"})
+    requests = []
+    for s in meta["sheets"]:
+        props = s["properties"]
+        if props["title"] not in (JOBS_TAB, FILTERED_TAB):
+            continue
+        header = book.worksheet(props["title"]).row_values(1)
+        if "date_found" not in header:
+            continue
+        specs = [{"dimensionIndex": header.index("date_found"), "sortOrder": "DESCENDING"}]
+        if "fit_score" in header:
+            specs.append({"dimensionIndex": header.index("fit_score"), "sortOrder": "DESCENDING"})
+        requests.append({"sortRange": {
+            "range": {"sheetId": props["sheetId"], "startRowIndex": 1, "startColumnIndex": 0,
+                      "endColumnIndex": props["gridProperties"]["columnCount"]},
+            "sortSpecs": specs,
+        }})
+    if requests:
+        book.batch_update({"requests": requests})
+
+
 def tidy(book: gspread.Spreadsheet, today: str, cfg: dict, warn=print) -> None:
     """Optional sheet niceties. A failure here is reported but never stops the run."""
     steps = [
@@ -260,6 +284,8 @@ def tidy(book: gspread.Spreadsheet, today: str, cfg: dict, warn=print) -> None:
         ("today's picks tab", lambda: ensure_picks_tab(book, cfg.get("picks_min_score", 7), cfg.get("picks_days", 3))),
         ("archive", lambda: print(f"Archived {archive_old(book, today, cfg.get('archive_after_days', 14))} old rows")),
     ]
+    if cfg.get("sort_newest_first", True):
+        steps.append(("sort newest first", lambda: sort_newest_first(book)))
     for name, step in steps:
         try:
             step()

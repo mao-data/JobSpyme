@@ -384,6 +384,14 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
                                      visa_evidence=df.loc[no_visa, "ai_sponsorship_evidence"])
         df = df[~no_visa].copy()
 
+    floor = ccfg.get("drop_score_at_or_below")
+    if floor is not None:
+        low = df["fit_score"].notna() & (df["fit_score"] <= floor)
+        dropped = pd.concat([dropped, df[low].assign(excluded_reason=f"Claude score {floor} or lower")])
+        df = df[~low].copy()
+        if low.any():
+            print(f"{int(low.sum())} jobs scored {floor} or lower; moved to Filtered out")
+
     top = df[df["fit_score"].fillna(0) >= ccfg.get("tailor_min_score", 8)]
     df["letter_file"] = ""
     df["cover_letter"] = ""

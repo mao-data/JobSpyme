@@ -21,7 +21,7 @@
 | 分頁 | 內容 |
 |---|---|
 | **今日精選** | 自動列出最近 3 天、7 分以上、`status` 還是空白的職缺，依分數排序。標了 status 就會從這頁消失。**每天只看這頁就好。** |
-| **Jobs** | 所有通過篩選的職缺。`status` 是下拉選單（想投 / 已投 / 面試 / Offer / 拒絕 / 不投），選了之後整列會上色；8 分以上的分數會變粗體綠字。 |
+| **Jobs** | 所有通過篩選的職缺，每次執行後**自動排序：最新的在最上面**，同一天的再依分數由高到低。Claude 評 3 分（含）以下的不會放進來，會直接進 Filtered out。`status` 是下拉選單（想投 / 已投 / 面試 / Offer / 拒絕 / 不投），選了之後整列會上色；8 分以上的分數會變粗體綠字。 |
 | **Filtered out** | 被排除的職缺和原因，可以用來檢查有沒有誤判。 |
 | **Run log** | 每次執行一列：成功或失敗、各數量、哪些步驟重試後還是失敗。見下方「自動重試和執行紀錄」。 |
 | **Archive** | 超過 14 天、`status` 還是空白的職缺，會自動從 Jobs 搬來這裡。**不想投的職缺不用標「不投」**，放著不管就好。 |
@@ -100,7 +100,8 @@ claude setup-token
 | `claude.backend` | `claude_code` 用訂閱；`api` 用 API key |
 | `claude.cli_model` | `sonnet`（較省訂閱額度）或 `opus` |
 | `claude.batch_size` | 一次送幾筆職缺給 Claude 評分 |
-| `claude.max_jobs_scored` | 每次最多評幾筆 |
+| `claude.max_jobs_scored` | 每次最多評幾筆（預設 300），超過的照樣寫進 Sheet，只是沒有分數 |
+| `claude.drop_score_at_or_below` | 評分在這個分數（含）以下的職缺移到 Filtered out（預設 3） |
 | `claude.tailor_min_score` | 幾分以上才產生 cover letter |
 
 改完 push 到 `main`，下一次執行就會套用。

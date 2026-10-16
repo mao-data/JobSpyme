@@ -56,7 +56,7 @@ proxies: []
 
 filters:
   # Drop jobs whose title contains any of these words (case-insensitive).
-  exclude_title_words: [senior, sr, lead, principal, staff, manager, director, head, vp, chief, intern]
+  exclude_title_words: [senior, sr, lead, principal, staff, manager, director, head, vp, chief, intern, helpdesk, help desk]
   # Drop jobs whose description says it won't sponsor a visa. Keep true for H-1B.
   require_sponsorship: true
 
@@ -75,6 +75,8 @@ sheet:
   picks_days: 3
   # Jobs rows with no status after this many days move to the Archive tab.
   archive_after_days: 14
+  # After each run, Jobs and Filtered out are sorted newest first (then by score).
+  sort_newest_first: true
 
 claude:
   enabled: true
@@ -91,4 +93,6 @@ claude:
   tailor_min_score: 8
   # Most jobs sent to Claude per run (newest first), to bound usage. Jobs past
   # the cap are still added to the sheet, unscored.
-  max_jobs_scored: 150
+  max_jobs_scored: 300
+  # Jobs Claude scores at or below this go to Filtered out instead of Jobs.
+  drop_score_at_or_below: 3
