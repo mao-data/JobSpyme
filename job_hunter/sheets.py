@@ -133,8 +133,10 @@ def keys_in(book: gspread.Spreadsheet, title: str) -> set[str]:
 
 
 def _cell(v):
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
+    # None (JSON null) leaves the cell truly empty. An empty string would be stored as
+    # text, which the sheet sorts above every number and counts as >= any score.
+    if v is None or (isinstance(v, float) and pd.isna(v)) or v is pd.NA or v == "":
+        return None
     if hasattr(v, "item"):  # numpy scalar -> plain Python, so JSON can carry it
         v = v.item()
     if isinstance(v, float) and v.is_integer():
@@ -265,23 +267,53 @@ PICKS_COLUMNS = ["fit_score", "summary_zh", "title", "company", "location", "sal
 
 
 def ensure_picks_tab(book: gspread.Spreadsheet, min_score: int, days: int) -> None:
-    """A tab whose formula lists recent, high-scoring jobs with no status yet.
-    Created once; it updates itself as rows are added or given a status."""
-    if PICKS_TAB in {ws.title for ws in book.worksheets()}:
-        return
+    """A tab whose formula lists recent, high-scoring jobs with no status yet. The
+    formula is rewritten each run, so changes to it reach an existing tab; the tab
+    then updates itself as rows are added or given a status."""
     header = book.worksheet(JOBS_TAB).row_values(1)
     col = {c: f"{JOBS_TAB}!{_col_letter(header.index(c) + 1)}2:{_col_letter(header.index(c) + 1)}"
            for c in PICKS_COLUMNS + ["status"]}
     columns = ", ".join(col[c] for c in PICKS_COLUMNS)
+    score = col["fit_score"]
     formula = (
         f'=IFERROR(SORT(FILTER({{{columns}}}, '
-        f'{col["fit_score"]}>={min_score}, {col["status"]}="", '
+        f'ISNUMBER({score}), {score}>={min_score}, {col["status"]}="", '
         f'{col["date_found"]}>=TEXT(TODAY()-{days},"yyyy-mm-dd")), 1, FALSE), '
         f'"目前沒有符合條件的職缺")'
     )
-    ws = book.add_worksheet(title=PICKS_TAB, rows=500, cols=len(PICKS_COLUMNS), index=0)
+    if PICKS_TAB in {ws.title for ws in book.worksheets()}:
+        ws = book.worksheet(PICKS_TAB)
+    else:
+        ws = book.add_worksheet(title=PICKS_TAB, rows=500, cols=len(PICKS_COLUMNS), index=0)
+        ws.freeze(rows=1)
     ws.update(range_name="A1", values=[PICKS_COLUMNS, [formula]], value_input_option="USER_ENTERED")
-    ws.freeze(rows=1)
+
+
+def clean_scores(book: gspread.Spreadsheet) -> None:
+    """Make every fit_score in Jobs a number or a truly empty cell. Earlier runs wrote
+    missing scores as empty text, which sorted above real scores and slipped into
+    今日精選; this repairs those rows in place."""
+    ws = book.worksheet(JOBS_TAB)
+    header = ws.row_values(1)
+    if "fit_score" not in header:
+        return
+    c = header.index("fit_score")
+    values = ws.col_values(c + 1)[1:]
+    if not values:
+        return
+    cells = []
+    for v in values:
+        try:
+            cells.append({"userEnteredValue": {"numberValue": float(v)}})
+        except ValueError:
+            # Not a number (empty, or text): clear it. Only blank-looking cells get here.
+            cells.append({"userEnteredValue": {"stringValue": v}} if v.strip() else {})
+    book.batch_update({"requests": [{"updateCells": {
+        "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": 1 + len(cells),
+                  "startColumnIndex": c, "endColumnIndex": c + 1},
+        "rows": [{"values": [cell]} for cell in cells],
+        "fields": "userEnteredValue",
+    }}]})
 
 
 def archive_old(book: gspread.Spreadsheet, today: str, days: int) -> int:
@@ -336,6 +368,7 @@ def sort_newest_first(book: gspread.Spreadsheet) -> None:
 def tidy(book: gspread.Spreadsheet, today: str, cfg: dict, warn=print) -> None:
     """Optional sheet niceties. A failure here is reported but never stops the run."""
     steps = [
+        ("clean empty scores", lambda: clean_scores(book)),
         ("status dropdown and colours", lambda: setup_jobs_tab(book)),
         ("today's picks tab", lambda: ensure_picks_tab(book, cfg.get("picks_min_score", 7), cfg.get("picks_days", 3))),
         ("archive", lambda: print(f"Archived {archive_old(book, today, cfg.get('archive_after_days', 14))} old rows")),
