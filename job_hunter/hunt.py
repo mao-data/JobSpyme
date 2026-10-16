@@ -217,8 +217,12 @@ def apply_filters(df: pd.DataFrame, cfg: dict, seen: set[str], sponsors: dict[st
     f = cfg.get("filters", {})
     df = df.copy()
     df["key"] = df.apply(job_key, axis=1)
+    before = len(df)
     df = df.drop_duplicates(subset="job_url").drop_duplicates(subset="key")
+    RUN.count("dup_removed", before - len(df))
+    before = len(df)
     df = df[~df["key"].isin(seen)]
+    RUN.count("already_seen", before - len(df))
 
     words = [w.lower() for w in f.get("exclude_title_words", [])]
     title_re = re.compile(r"\b(" + "|".join(map(re.escape, words)) + r")\b", re.I) if words else None
@@ -345,17 +349,19 @@ def score_batch(llm, batch: list[tuple[int, str]]) -> dict[int, dict]:
 
 
 def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
-    """Returns (scored shortlist, jobs Claude found won't sponsor)."""
+    """Returns (scored jobs to keep, jobs to filter out, jobs left unscored).
+    Unscored jobs carry a `reason`; the caller queues them for the next run."""
     ccfg = cfg["claude"]
     llm = make_llm(ccfg, SYSTEM.replace("{resume}", resume))
-    limit = ccfg.get("max_jobs_scored", 150)
+    limit = ccfg.get("max_jobs_scored", 300)
     overflow = df.iloc[0:0]
     if len(df) > limit:
-        # Jobs past the cap still go to the sheet, unscored: the search only covers
-        # recent postings, so a job skipped today would never come back.
-        print(f"{len(df)} jobs passed the filters; scoring the {limit} newest (max_jobs_scored).")
-        df = df.sort_values("date_posted", ascending=False, na_position="last")
-        overflow = df.iloc[limit:].assign(summary_zh="未評分：超過每次評分上限 (max_jobs_scored)")
+        # Queued jobs (from_pending) go first, then the newest.
+        print(f"{len(df)} jobs to score; scoring {limit} now (max_jobs_scored), queueing the rest.")
+        order = df.assign(_q=df.get("from_pending", False).fillna(False).astype(bool),
+                          _d=pd.to_datetime(df["date_posted"].astype(str), errors="coerce"))
+        df = order.sort_values(["_q", "_d"], ascending=[False, False], na_position="last").drop(columns=["_q", "_d"])
+        overflow = df.iloc[limit:].assign(reason="over max_jobs_scored")
         df = df.iloc[:limit]
     df = df.reset_index(drop=True)
 
@@ -367,6 +373,13 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
     with ThreadPoolExecutor(max_workers=3) as pool:
         for part in pool.map(lambda b: score_batch(llm, b), batches):
             results.update(part)
+    # One odd posting can sink a whole batch: give failed jobs a second pass on
+    # their own, unless so many failed that Claude itself is likely down.
+    failed = [(i, t) for i, t in items if "error" in results[i]]
+    if 0 < len(failed) <= 20:
+        print(f"Re-scoring {len(failed)} jobs one at a time...")
+        for one in failed:
+            results.update(score_batch(llm, [one]))
     res = [results[i] for i in df.index]
 
     df["fit_score"] = [r.get("fit_score") for r in res]
@@ -376,6 +389,12 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
     df["summary_zh"] = [r.get("summary_zh") or r.get("error", "") for r in res]
     df["matched_skills"] = [", ".join(r.get("matched_skills", [])) for r in res]
     df["missing_skills"] = [", ".join(r.get("missing_skills", [])) for r in res]
+    RUN.count("scored", int(df["fit_score"].notna().sum()))
+    errored = df[df["fit_score"].isna()].assign(reason="Claude scoring failed")
+    RUN.count("score_failed", len(errored))
+    RUN.count("over_cap", len(overflow))
+    unscored = pd.concat([overflow, errored])
+    df = df[df["fit_score"].notna()].copy()
 
     dropped = df.iloc[0:0]
     if cfg.get("filters", {}).get("require_sponsorship", True):
@@ -416,9 +435,9 @@ def run_claude(df: pd.DataFrame, cfg: dict, resume: str, letters_dir: Path):
             df.at[idx, "cover_letter"] = t["cover_letter"]
 
     print(llm.usage_note())
-    RUN.count("scored", int(df["fit_score"].notna().sum()))
-    df = pd.concat([df, overflow], ignore_index=True)
-    return df.sort_values("fit_score", ascending=False, na_position="last"), dropped
+    RUN.count("dropped_by_claude", len(dropped))
+    RUN.count("scored_kept", len(df))
+    return df.sort_values("fit_score", ascending=False), dropped, unscored
 
 
 # ---------- output ----------
@@ -453,6 +472,61 @@ def write_excel(path: Path, shortlist: pd.DataFrame, excluded: pd.DataFrame) -> 
                         cell.hyperlink, cell.style = cell.value, "Hyperlink"
 
 
+def check_accounting(use_claude: bool) -> None:
+    """Every scraped job must end up in exactly one place. Any gap is a failure."""
+    c = RUN.counts.get
+    lines = []
+    ok = True
+
+    def check(label, left, right):
+        nonlocal ok
+        good = left == right
+        ok &= good
+        lines.append(f"{'OK ' if good else 'MISMATCH'} {label}: {left} = {right}")
+
+    check("scraped = duplicates + already in sheet + filtered by rules + passed",
+          c("scraped", 0), c("dup_removed", 0) + c("already_seen", 0) + c("filtered_by_rules", 0) + c("passed_rules", 0))
+    if use_claude:
+        total = c("passed_rules", 0) + c("from_queue", 0)
+        check("passed + from 待評分 = scored + score failed + over cap",
+              total, c("scored", 0) + c("score_failed", 0) + c("over_cap", 0))
+        check("scored = kept in Jobs + filtered out by Claude",
+              c("scored", 0), c("scored_kept", 0) + c("dropped_by_claude", 0))
+        check("score failed + over cap = queued for next run + gave up",
+              c("score_failed", 0) + c("over_cap", 0), c("queued_for_next_run", 0) + c("gave_up", 0))
+    RUN.accounting = lines
+    RUN.accounting_ok = ok
+    print("\n===== Accounting =====")
+    for line in lines:
+        print(line)
+    if not ok:
+        RUN.failures.append(("Accounting", "some jobs are not accounted for; see the Accounting section"))
+    unscored = c("score_failed", 0) + c("over_cap", 0)
+    if use_claude and unscored:
+        RUN.warn(f"{unscored} jobs not scored this run (score failed {c('score_failed', 0)}, "
+                 f"over cap {c('over_cap', 0)}); they wait in 待評分 for the next run")
+
+
+def verify_sheet(book, jobs: pd.DataFrame, filtered: pd.DataFrame, queue) -> None:
+    """Read the sheet back and confirm every row we meant to write is there."""
+    import sheets
+
+    def check():
+        problems = []
+        for tab, df in ((sheets.JOBS_TAB, jobs), (sheets.FILTERED_TAB, filtered), (sheets.PENDING_TAB, queue)):
+            if df is None or df.empty:
+                continue
+            missing = set(df["key"]) - sheets.keys_in(book, tab)
+            if missing:
+                problems.append(f"{tab}: {len(missing)} of {len(df)} rows missing, e.g. {sorted(missing)[:3]}")
+        if problems:
+            raise StepFailed("; ".join(problems))
+        return True
+
+    if RUN.attempt("Google Sheet: verify rows were written", check, waits=(10, 30)):
+        print("Verified: every job written to the sheet is there.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(HERE / "config.yaml"))
@@ -476,18 +550,45 @@ def main():
         seen |= keys
     sponsors = load_h1b_sponsors(cfg.get("h1b_sponsor_files") or [])
 
+    pending = pd.DataFrame()
+    if book is not None and use_claude:
+        pending = RUN.attempt("Google Sheet: read 待評分 queue", lambda: sheets.read_pending(book))
+        if pending is None:
+            finish(book, exit_code=1, note="Stopped: couldn't read the 待評分 tab, so its jobs could be lost.")
+        RUN.count("from_queue", len(pending))
+        if len(pending):
+            print(f"{len(pending)} jobs waiting in 待評分 from earlier runs; scoring them first.")
+
     raw = scrape(cfg)
     RUN.count("scraped", len(raw))
-    if raw.empty:
+    if raw.empty and pending.empty:
         finish(book, exit_code=1, note="No jobs found. Boards may be blocking us (see the failures above).")
-    shortlist, excluded = apply_filters(raw, cfg, seen, sponsors)
+    if raw.empty:
+        shortlist, excluded = pd.DataFrame(columns=["key"]), pd.DataFrame(columns=["key"])
+    else:
+        shortlist, excluded = apply_filters(raw, cfg, seen, sponsors)
+    RUN.count("filtered_by_rules", len(excluded))
+    RUN.count("passed_rules", len(shortlist))
     print(f"Scraped {len(raw)}, new and passing filters: {len(shortlist)}, filtered out: {len(excluded)}")
 
     today = date.today().isoformat()
     run_dir = OUTPUT_DIR / today
-    if use_claude and not shortlist.empty:
-        shortlist, dropped = run_claude(shortlist, cfg, resume, run_dir / "letters")
-        excluded = pd.concat([excluded, dropped])
+    queue = pd.DataFrame()
+    if use_claude:
+        to_score = pd.concat([pending.assign(from_pending=True), shortlist.assign(from_pending=False)],
+                             ignore_index=True)
+        if not to_score.empty:
+            shortlist, dropped, unscored = run_claude(to_score, cfg, resume, run_dir / "letters")
+            excluded = pd.concat([excluded, dropped])
+            # A job that failed to score on 3 runs goes to Jobs unscored rather than wait forever.
+            unscored["attempts"] = unscored.get("attempts", 0)
+            unscored["attempts"] = pd.to_numeric(unscored["attempts"], errors="coerce").fillna(0).astype(int)
+            unscored.loc[unscored["reason"] == "Claude scoring failed", "attempts"] += 1
+            gave_up = unscored[unscored["attempts"] >= 3].assign(summary_zh="未評分：Claude 評分連續 3 次失敗")
+            queue = unscored[unscored["attempts"] < 3]
+            shortlist = pd.concat([shortlist, gave_up])
+            RUN.count("gave_up", len(gave_up))
+        RUN.count("queued_for_next_run", len(queue))
 
     out = run_dir / f"jobs_{today}.xlsx"
     write_excel(out, shortlist, excluded)
@@ -499,11 +600,18 @@ def main():
         ok_jobs = RUN.attempt("Google Sheet: add jobs", lambda: sheets.append_tab(book, sheets.JOBS_TAB, to_add, today))
         ok_filtered = RUN.attempt("Google Sheet: add filtered-out rows",
                                   lambda: sheets.append_tab(book, sheets.FILTERED_TAB, excluded, today))
+        ok_queue = True
+        if use_claude:
+            ok_queue = RUN.attempt("Google Sheet: update 待評分 queue",
+                                   lambda: sheets.write_pending(book, queue, today))
         if ok_jobs is not None:
             RUN.count("jobs_added", len(to_add))
-        if ok_jobs is None or ok_filtered is None:
+        if ok_jobs is None or ok_filtered is None or ok_queue is None:
             exit_code = 1  # GitHub emails you when a run fails
+        else:
+            verify_sheet(book, to_add, excluded, queue if use_claude else None)
         sheets.tidy(book, today, cfg.get("sheet", {}), warn=RUN.warn)
+    check_accounting(use_claude)
 
     # Remember what we looked at, so tomorrow's run only shows new jobs. Without
     # Claude, the shortlist isn't remembered so a later full run still scores it.

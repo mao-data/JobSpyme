@@ -49,6 +49,8 @@ class RunLog:
         self.recovered: list[tuple[str, int]] = []  # (step, attempts it took)
         self.warnings: list[str] = []
         self.counts: dict[str, int] = {}
+        self.accounting: list[str] = []      # filled by hunt.check_accounting
+        self.accounting_ok: bool | None = None
 
     def attempt(self, step: str, fn, waits: tuple[int, ...] | None = None):
         """fn() up to `attempts` times. Returns its result, or None if every try failed."""
@@ -105,6 +107,8 @@ class RunLog:
             lines.append(f"Failed after {self.attempts} tries ({len(self.failures)}):")
             lines += [f"  - {s}: {e}" for s, e in self.failures]
         lines += [f"Warning: {w}" for w in self.warnings]
+        if self.accounting:
+            lines.append("Accounting: " + ("all jobs accounted for" if self.accounting_ok else "MISMATCH"))
         return lines
 
     def print_summary(self) -> None:
@@ -127,6 +131,8 @@ class RunLog:
             md += [f"- {s} (try {n})" for s, n in self.recovered]
         if self.warnings:
             md += ["", "### Warnings", ""] + [f"- {w}" for w in self.warnings]
+        if self.accounting:
+            md += ["", "### Accounting (every scraped job accounted for?)", "", "```"] + self.accounting + ["```"]
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n".join(md) + "\n")
 
@@ -143,4 +149,6 @@ class RunLog:
             "details": "\n".join(f"{s}: {e}" for s, e in self.failures) or "",
             "per_site": ", ".join(f"{k[5:]}={v}" for k, v in sorted(self.counts.items()) if k.startswith("site_")),
             "run_url": self.run_url(),
+            "check": "" if self.accounting_ok is None else ("OK" if self.accounting_ok else "不符"),
+            "accounting": "\n".join(self.accounting),
         }
