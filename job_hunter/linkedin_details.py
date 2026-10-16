@@ -40,15 +40,18 @@ def fetch_description(session: requests.Session, job_id: str) -> tuple[int, str]
 
 
 def fill_descriptions(urls: list[str], opts: dict, proxies: list[str] | None = None,
-                      fetch=fetch_description, sleep=time.sleep) -> dict[str, str]:
-    """Description per job URL, for as many as LinkedIn lets us read."""
+                      fetch=fetch_description, sleep=time.sleep, log=None) -> dict[str, str]:
+    """Description per job URL, for as many as LinkedIn lets us read. Each page gets
+    up to 3 tries; `log` (a RunLog) records the pages that still failed."""
     session = requests.Session()
     session.headers.update(HEADERS)
     proxy_cycle = proxies or [None]
     delay_min, delay_max = opts.get("detail_delay", [5, 9])
     backoff = opts.get("backoff_seconds", 70)
+    tries = opts.get("tries", 3)
     limit = opts.get("max_descriptions", 80)
     out: dict[str, str] = {}
+    failed: list[str] = []
     blocked_in_a_row = 0
     todo = [(u, job_id_from_url(u)) for u in urls[:limit] if job_id_from_url(u)]
     print(f"Fetching {len(todo)} LinkedIn descriptions slowly...", flush=True)
@@ -61,19 +64,31 @@ def fill_descriptions(urls: list[str], opts: dict, proxies: list[str] | None = N
             session.proxies = {"http": p, "https": p}
         else:
             session.proxies = {}
-        status, text = fetch(session, job_id)
-        if status == 429:
-            print(f"    429 from LinkedIn, waiting {backoff}s", flush=True)
-            sleep(backoff)
+        for attempt in range(1, tries + 1):
             status, text = fetch(session, job_id)
-        if status == 429:
-            blocked_in_a_row += 1
-            if blocked_in_a_row >= 3:
-                print("    LinkedIn keeps refusing; skipping the remaining descriptions this run", flush=True)
+            if status == 200 or attempt == tries:
                 break
+            # 429 means slow down a lot; anything else (network error, 5xx) a little.
+            wait = backoff if status == 429 else 10
+            print(f"    [retry {attempt}/{tries - 1}] LinkedIn job {job_id}: HTTP {status or 'error'}; "
+                  f"waiting {wait}s", flush=True)
+            sleep(wait)
+        if status == 200:
+            blocked_in_a_row = 0
+            if text:
+                out[url] = text
             continue
-        blocked_in_a_row = 0
-        if text:
-            out[url] = text
+        failed.append(f"{job_id} (HTTP {status or 'error'})")
+        blocked_in_a_row = blocked_in_a_row + 1 if status == 429 else 0
+        if blocked_in_a_row >= 3:
+            print("    LinkedIn keeps refusing; skipping the remaining descriptions this run", flush=True)
+            if log is not None:
+                log.warn(f"LinkedIn job pages: stopped after 3 jobs in a row were refused {tries} times; "
+                         f"{len(todo) - n - 1} left without a description")
+            break
     print(f"    got {len(out)} of {len(todo)}", flush=True)
+    if failed and log is not None:
+        log.failures.append((f"LinkedIn job pages ({len(failed)} of {len(todo)})",
+                             f"no description after {tries} tries: " + ", ".join(failed[:10])
+                             + (" ..." if len(failed) > 10 else "")))
     return out

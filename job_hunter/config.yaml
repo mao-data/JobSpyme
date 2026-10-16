@@ -18,8 +18,9 @@ locations:
   - Texas
   - New Jersey
 
-# Only keep jobs posted within this many hours. 24 suits a daily run.
-hours_old: 24
+# Only keep jobs posted within this many hours. 48 overlaps the previous day's run,
+# so a missed or late run loses nothing; jobs already in the sheet are skipped.
+hours_old: 48
 
 # Per board: results per search, and whether to fetch each job page for the
 # description (Indeed includes it already; the others need the extra request,
@@ -37,12 +38,16 @@ sites:
     slow_descriptions: true
     max_descriptions: 80       # per run
     detail_delay: [5, 9]       # seconds between job pages
-    backoff_seconds: 70        # wait after a 429, then retry once
+    backoff_seconds: 70        # wait after a 429 on a job page before trying again
+    retry_waits: [60, 120]     # waits between the 3 tries of a failed search
   # ZipRecruiter and Glassdoor answer 403 to every request from GitHub Actions
   # servers. They can work from a home connection or through proxies:
   # zip_recruiter: {results_wanted: 25, fetch_description: true}
   # glassdoor:     {results_wanted: 25, fetch_description: true}
 
+# Every search, Claude call and Google Sheet write gets up to 3 tries. A site whose
+# searches fail 3 times in a row is skipped for the rest of the run. Failures are
+# listed at the end of the log, on the Actions run page, and in the sheet's Run log tab.
 # Seconds to wait between searches, to avoid 429 blocks (a site can override it).
 pause_seconds: 5
 
@@ -51,7 +56,7 @@ proxies: []
 
 filters:
   # Drop jobs whose title contains any of these words (case-insensitive).
-  exclude_title_words: [senior, sr, lead, principal, staff, manager, director, head, vp, chief, intern]
+  exclude_title_words: [senior, sr, lead, principal, staff, manager, director, head, vp, chief, intern, helpdesk, help desk]
   # Drop jobs whose description says it won't sponsor a visa. Keep true for H-1B.
   require_sponsorship: true
 
@@ -62,6 +67,16 @@ h1b_sponsor_files: []
 # Google Sheet that each run adds new jobs to. Leave empty to only write Excel.
 # The sheet must be shared with the service account (see README).
 google_sheet_id: 151HhbH4f_HU-1IXApMNbLWr8nLH_yfalxkDjoN2TaE8
+
+sheet:
+  # 「今日精選」tab: jobs found in the last picks_days days, scoring at least
+  # picks_min_score, with no status yet. Delete the tab to have it rebuilt.
+  picks_min_score: 7
+  picks_days: 3
+  # Jobs rows with no status after this many days move to the Archive tab.
+  archive_after_days: 14
+  # After each run, Jobs and Filtered out are sorted newest first (then by score).
+  sort_newest_first: true
 
 claude:
   enabled: true
@@ -78,4 +93,6 @@ claude:
   tailor_min_score: 8
   # Most jobs sent to Claude per run (newest first), to bound usage. Jobs past
   # the cap are still added to the sheet, unscored.
-  max_jobs_scored: 150
+  max_jobs_scored: 300
+  # Jobs Claude scores at or below this go to Filtered out instead of Jobs.
+  drop_score_at_or_below: 3
