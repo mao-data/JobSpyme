@@ -17,6 +17,7 @@ JOBS_TAB = "Jobs"
 FILTERED_TAB = "Filtered out"
 ARCHIVE_TAB = "Archive"
 PICKS_TAB = "今日精選"
+PENDING_TAB = "待評分"
 
 JOBS_COLUMNS = [
     "date_found", "fit_score", "summary_zh", "title", "company", "location", "is_remote", "site",
@@ -57,9 +58,13 @@ def _tab(book: gspread.Spreadsheet, title: str, columns: list[str], first: bool 
             ws.update(range_name="A1", values=[columns])
             ws.freeze(rows=1)
         else:
-            missing = [c for c in columns if c not in ws.row_values(1)]
+            # A newer version added columns: put them at the end, keep everything else.
+            header = ws.row_values(1)
+            missing = [c for c in columns if c not in header]
             if missing:
-                raise SystemExit(f"Tab '{title}' is missing columns {missing}. Add them to row 1 or rename the tab.")
+                if ws.col_count < len(header) + len(missing):
+                    ws.add_cols(len(header) + len(missing) - ws.col_count)
+                ws.update(range_name=f"{_col_letter(len(header) + 1)}1", values=[missing])
     return ws
 
 
@@ -70,10 +75,61 @@ def known_keys(book: gspread.Spreadsheet) -> set[str]:
         ws = _tab(book, title, columns, first)
         header = ws.row_values(1)
         keys.update(k for k in ws.col_values(header.index("key") + 1)[1:] if k)
-    archive = {ws.title: ws for ws in book.worksheets()}.get(ARCHIVE_TAB)
-    if archive is not None and "key" in archive.row_values(1):
-        keys.update(k for k in archive.col_values(archive.row_values(1).index("key") + 1)[1:] if k)
+    tabs = {ws.title: ws for ws in book.worksheets()}
+    for title in (ARCHIVE_TAB, PENDING_TAB):
+        ws = tabs.get(title)
+        if ws is not None and "key" in ws.row_values(1):
+            keys.update(k for k in ws.col_values(ws.row_values(1).index("key") + 1)[1:] if k)
     return keys
+
+
+# ---------- jobs waiting to be scored ----------
+
+PENDING_COLUMNS = [
+    "date_found", "attempts", "reason", "title", "company", "location", "site", "date_posted",
+    "is_remote", "min_amount", "max_amount", "interval", "h1b_approvals", "visa_rule", "visa_evidence",
+    "search_term", "job_url", "job_url_direct", "key", "description",
+]
+
+
+def read_pending(book: gspread.Spreadsheet) -> pd.DataFrame:
+    """Jobs a previous run couldn't score, to be scored first this run."""
+    ws = {w.title: w for w in book.worksheets()}.get(PENDING_TAB)
+    if ws is None:
+        return pd.DataFrame(columns=PENDING_COLUMNS)
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return pd.DataFrame(columns=PENDING_COLUMNS)
+    df = pd.DataFrame(rows[1:], columns=rows[0]).replace("", None)
+    df["attempts"] = pd.to_numeric(df.get("attempts"), errors="coerce").fillna(0).astype(int)
+    for c in ("min_amount", "max_amount", "h1b_approvals"):
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "is_remote" in df:
+        df["is_remote"] = df["is_remote"].map(lambda v: str(v).upper() == "TRUE")
+    return df
+
+
+def write_pending(book: gspread.Spreadsheet, df: pd.DataFrame, today: str) -> bool:
+    """Replace the 待評分 tab with the jobs still waiting for a score."""
+    ws = _tab(book, PENDING_TAB, PENDING_COLUMNS)
+    header = ws.row_values(1)
+    df = df.copy()
+    if "date_found" in df:
+        df["date_found"] = df["date_found"].fillna(today)
+    rows = [[_cell(r.get(c)) for c in header] for _, r in df.iterrows()]
+    for row in rows:  # first-seen date for jobs new to the queue
+        i = header.index("date_found")
+        row[i] = row[i] or today
+    ws.clear()
+    ws.update(range_name="A1", values=[header] + rows)
+    return True
+
+
+def keys_in(book: gspread.Spreadsheet, title: str) -> set[str]:
+    ws = book.worksheet(title)
+    header = ws.row_values(1)
+    return {k for k in ws.col_values(header.index("key") + 1)[1:] if k}
 
 
 def _cell(v):
@@ -127,7 +183,7 @@ def append_run(book: gspread.Spreadsheet, shortlist: pd.DataFrame, excluded: pd.
 
 RUNLOG_TAB = "Run log"
 RUNLOG_COLUMNS = ["run_time", "status", "minutes", "scraped", "new_jobs", "scored", "failed_steps",
-                  "retried_ok", "details", "per_site", "run_url"]
+                  "retried_ok", "details", "per_site", "run_url", "check", "accounting"]
 
 
 def append_runlog(book: gspread.Spreadsheet, row: dict) -> bool:
