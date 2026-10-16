@@ -96,3 +96,18 @@ claude:
   max_jobs_scored: 300
   # Jobs Claude scores at or below this go to Filtered out instead of Jobs.
   drop_score_at_or_below: 3
+
+# Tailored resumes: set a job's status to 想投 in the Jobs tab, and the next run
+# (or a manual "resumes_only" run) makes a one-page resume PDF, an editable Google
+# Doc and a cover letter, puts them in your Drive and links them in that row.
+# Facts come only from the EXPERIENCE_BANK secret; see README.
+resume:
+  enabled: true
+  max_per_run: 10
+  # opus writes better; sonnet uses less of your subscription.
+  cli_model: opus
+  # Drafts per job that may fail the fact check before giving up on this run.
+  fact_check_tries: 3
+  # Runs that may fail for one job before it stops retrying (clear resume_changes to retry).
+  max_tries: 3
+  drive_folder: Job Hunter Resumes

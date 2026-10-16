@@ -1,5 +1,7 @@
 # Personal data: never commit
 resume.*
+!resume.py
+experience_bank.yaml
 *.pdf
 output/
 data/

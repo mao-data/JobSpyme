@@ -28,10 +28,39 @@
 | **Archive** | 超過 14 天、`status` 還是空白的職缺，會自動從 Jobs 搬來這裡。**不想投的職缺不用標「不投」**，放著不管就好。 |
 
 使用方式：
-- 你唯一要做的，是投完之後把 `status` 改成「已投」，之後依進度改成「面試」等等。標過 status 的列永遠不會被移動。
+- 想投的職缺，在 **Jobs** 分頁把 `status` 改成「想投」，下次執行就會自動產生客製履歷（見下方「客製履歷」）。「今日精選」是公式產生的，不能在那裡改 status。
+- 投完之後把 `status` 改成「已投」，之後依進度改成「面試」等等。標過 status 的列永遠不會被移動。
 - 可以任意排序、篩選、加欄位，程式是依第 1 列的欄名寫入。
 - **不要刪除列**：刪掉的職缺如果重新刊登，會再跑回來。不想看的就標「不投」或放著讓它自動歸檔。
 - 精選的門檻（分數、天數）和歸檔天數，可以在 `config.yaml` 的 `sheet` 區段調整。「今日精選」分頁刪掉後，下次執行會重建。
+
+## 客製履歷（status 設為「想投」）
+
+在 Jobs 分頁把某個職缺的 `status` 改成**想投**，下一次執行時程式會：
+
+1. 把職缺描述和你的**經歷資料庫**交給 Claude，挑出最相關的經歷、調整順序和措辭，產生一頁履歷和一封 cover letter。
+2. **事實檢查**：每一條 bullet 都要標明根據哪一條經歷。只要出現經歷資料庫裡沒有的數字或工具（例如資料庫裡沒有 Snowflake，卻寫了 Snowflake），就退回重寫，最多 3 次。提到簽證或工作身分也會退回。
+3. 用 [RenderCV](https://github.com/rendercv/rendercv) 排成**一頁 PDF**。超過一頁時，依序刪掉證照、TA，再刪最長那段經歷的最後一條，直到剩一頁。
+4. 上傳到你的 Google Drive 的 `Job Hunter Resumes/年-月/` 資料夾：PDF、可以編輯的 Google Doc 版履歷、cover letter（Google Doc）。
+5. 在同一列填入：
+
+| 欄位 | 內容 |
+|---|---|
+| `resume_pdf` / `resume_doc` / `cover_letter_doc` | 點了就開的連結 |
+| `resume_changes` | 這份履歷強調了什麼、為什麼（中文） |
+| `keyword_coverage` | 職缺要求的關鍵字，原本的履歷有幾個 → 新履歷有幾個，以及還缺哪些。缺的關鍵字如果你其實會，把它加進經歷資料庫，下次就會用上 |
+
+- **不想等隔天**：到 Actions → Job Hunter → Run workflow，勾選 `resumes_only`，幾分鐘內就會產生，不會抓新職缺。
+- **產生失敗**時，`resume_changes` 會寫「產生失敗（第 n 次）」和原因，下次執行自動再試。連續 3 次失敗就停止重試；清空那一格會重新開始。
+- **想重新產生**：清空 `resume_pdf` 那一格。
+- 職缺描述存在隱藏的 `_descriptions` 分頁。這個功能上線前就在 Sheet 裡的職缺沒有描述，程式會試著從職缺網址抓；抓不到就只依職稱撰寫，`resume_changes` 會註明。
+- 每份履歷用一次 Claude（事實檢查不過時會多幾次）。預設用 opus，寫得比較好；想省額度，可以在 `config.yaml` 把 `resume.cli_model` 改成 `sonnet`。
+
+### 經歷資料庫（EXPERIENCE_BANK）
+
+一個 YAML，列出你的聯絡資料、每段工作的「事實」（每條有 id 和標籤）、學歷、技能、證照，以及改寫規則（例如「不寫工作身分」「不寫 MBA」）。**履歷裡的每一句話都只能來自這裡。**有新的經歷或成果，就更新這個 Secret，之後的履歷就會用上。
+
+它含有個人資料，所以放在 GitHub Secret，不會進 repo。在自己電腦上執行時，可以存成 `job_hunter/experience_bank.yaml`（已被 `.gitignore` 排除）。
 
 ## 自動重試和執行紀錄
 
@@ -93,6 +122,8 @@ claude setup-token
 | `CLAUDE_CODE_OAUTH_TOKEN` | 步驟 1 得到的 token |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | 步驟 2 下載的 JSON 檔**完整內容** |
 | `RESUME_TEXT` | 你的履歷**純文字**（從 PDF 複製貼上即可） |
+| `EXPERIENCE_BANK` | 經歷資料庫 YAML 的**完整內容**（客製履歷用） |
+| `GOOGLE_OAUTH_TOKEN_JSON` | 有 Drive 權限的 OAuth token JSON（客製履歷上傳用，見下方步驟 5） |
 | `JOBSPY_PROXIES`（選填） | proxy 清單，用逗號分隔，例如 `user:pass@host:port,user:pass@host2:port` |
 
 履歷用 Secret 存放，不會出現在 repo 裡。
@@ -104,6 +135,16 @@ claude setup-token
 3. 第一次建議勾選 `no_claude`，只測試抓職缺和寫入 Sheet。成功後再不勾選跑一次完整流程。
 
 之後每天台灣時間晚上 10:17（美西早上約 7 點）會自動執行。要改時間，修改 `.github/workflows/job-hunter.yml` 的 `cron`（時間是 UTC）。
+
+### 5. Google Drive 授權（客製履歷用）
+
+服務帳號不能在個人 Drive 建立檔案，所以履歷用你自己的帳號上傳：
+1. 在同一個 Google Cloud 專案啟用 **Google Drive API**。
+2. 「OAuth 同意畫面」設為**外部**，並按「**發布應用程式**」（測試模式的 token 7 天就會失效）。
+3. 建立「OAuth 用戶端 ID」（類型：電腦版應用程式），用它取得 `https://www.googleapis.com/auth/drive.file` 範圍的 refresh token。
+4. 把 `{"client_id": ..., "client_secret": ..., "refresh_token": ..., "token_uri": "https://oauth2.googleapis.com/token"}` 存成 Secret `GOOGLE_OAUTH_TOKEN_JSON`。
+
+`drive.file` 範圍只能看到程式自己建立的檔案，碰不到你 Drive 裡的其他東西。
 
 ## 設定（config.yaml）
 
@@ -121,6 +162,8 @@ claude setup-token
 | `claude.max_jobs_scored` | 每次最多評幾筆（預設 300），超過的照樣寫進 Sheet，只是沒有分數 |
 | `claude.drop_score_at_or_below` | 評分在這個分數（含）以下的職缺移到 Filtered out（預設 3） |
 | `claude.tailor_min_score` | 幾分以上才產生 cover letter |
+| `resume.cli_model` | 客製履歷用的模型：`opus`（預設）或 `sonnet` |
+| `resume.max_per_run` | 每次最多產生幾份履歷（預設 10） |
 
 改完 push 到 `main`，下一次執行就會套用。
 

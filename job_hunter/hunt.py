@@ -4,6 +4,7 @@ score the rest against your resume with Claude, and write an Excel shortlist.
 Usage:
     python hunt.py                 # full run
     python hunt.py --no-claude     # scrape + filter only, no Claude usage
+    python hunt.py --resumes-only  # only make resumes for jobs marked 想投
     python hunt.py --config other.yaml
 """
 
@@ -531,6 +532,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(HERE / "config.yaml"))
     ap.add_argument("--no-claude", action="store_true", help="skip Claude scoring")
+    ap.add_argument("--resumes-only", action="store_true",
+                    help="skip the job search; only make resumes for jobs marked 想投")
     args = ap.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -548,6 +551,12 @@ def main():
             # Without the sheet's keys every job would be added again as new.
             finish(None, exit_code=1, note="Stopped: couldn't read the Google Sheet, so nothing was scraped.")
         seen |= keys
+    if args.resumes_only:
+        if book is None:
+            finish(None, exit_code=1, note="--resumes-only needs google_sheet_id.")
+        import resume as tailor
+        tailor.make_resumes(book, cfg, RUN, resume, date.today().isoformat())
+        finish(book, 1 if RUN.counts.get("resumes_failed") else 0)
     sponsors = load_h1b_sponsors(cfg.get("h1b_sponsor_files") or [])
 
     pending = pd.DataFrame()
@@ -606,10 +615,15 @@ def main():
                                    lambda: sheets.write_pending(book, queue, today))
         if ok_jobs is not None:
             RUN.count("jobs_added", len(to_add))
+            # Posting text, for tailoring a resume if you later mark the job 想投.
+            RUN.attempt("Google Sheet: save job descriptions", lambda: sheets.append_descriptions(book, to_add))
         if ok_jobs is None or ok_filtered is None or ok_queue is None:
             exit_code = 1  # GitHub emails you when a run fails
         else:
             verify_sheet(book, to_add, excluded, queue if use_claude else None)
+        if use_claude:
+            import resume as tailor
+            tailor.make_resumes(book, cfg, RUN, resume, today)
         sheets.tidy(book, today, cfg.get("sheet", {}), warn=RUN.warn)
     check_accounting(use_claude)
 

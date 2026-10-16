@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import gspread
 import pandas as pd
@@ -23,8 +24,13 @@ JOBS_COLUMNS = [
     "date_found", "fit_score", "summary_zh", "title", "company", "location", "is_remote", "site",
     "date_posted", "salary", "ai_sponsorship", "sponsorship_evidence", "h1b_approvals",
     "years_required", "matched_skills", "missing_skills", "job_url", "job_url_direct",
-    "cover_letter", "status", "notes", "key",
+    "cover_letter", "status", "notes",
+    # Filled when you set status to 想投 (see resume.py)
+    "resume_pdf", "resume_doc", "cover_letter_doc", "resume_changes", "keyword_coverage",
+    "key",
 ]
+RESUME_COLUMNS = ["resume_pdf", "resume_doc", "cover_letter_doc", "resume_changes", "keyword_coverage"]
+WANT_STATUS = "想投"
 FILTERED_COLUMNS = ["date_found", "excluded_reason", "title", "company", "location", "site",
                     "visa_evidence", "job_url", "key"]
 
@@ -81,6 +87,80 @@ def known_keys(book: gspread.Spreadsheet) -> set[str]:
         if ws is not None and "key" in ws.row_values(1):
             keys.update(k for k in ws.col_values(ws.row_values(1).index("key") + 1)[1:] if k)
     return keys
+
+
+# ---------- job descriptions, kept for tailoring resumes ----------
+
+DESC_TAB = "_descriptions"
+DESC_COLUMNS = ["key", "description"]
+DESC_MAX = 15000
+
+
+def append_descriptions(book: gspread.Spreadsheet, df: pd.DataFrame) -> bool:
+    """Save the posting text of jobs added to Jobs, so a resume can be tailored to it
+    later. A hidden tab: the Jobs tab stays readable."""
+    if df.empty or "description" not in df:
+        return True
+    new = DESC_TAB not in {w.title for w in book.worksheets()}
+    ws = _tab(book, DESC_TAB, DESC_COLUMNS)
+    if new:
+        book.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
+    rows = [[r["key"], str(r["description"])[:DESC_MAX]] for _, r in df.iterrows()
+            if isinstance(r.get("description"), str) and r["description"].strip()]
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
+    return True
+
+
+def descriptions(book: gspread.Spreadsheet, keys: set[str]) -> dict[str, str]:
+    ws = {w.title: w for w in book.worksheets()}.get(DESC_TAB)
+    if ws is None:
+        return {}
+    return {r[0]: r[1] for r in ws.get_all_values()[1:] if len(r) > 1 and r[0] in keys}
+
+
+# ---------- jobs you marked 想投 ----------
+
+FAILED_PREFIX = "產生失敗"
+
+
+def wanted_jobs(book: gspread.Spreadsheet, max_tries: int = 3) -> list[dict]:
+    """Jobs rows with status 想投 and no resume yet (and fewer than `max_tries` failures)."""
+    ws = _tab(book, JOBS_TAB, JOBS_COLUMNS, True)
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return []
+    header = rows[0]
+    out = []
+    for r in rows[1:]:
+        job = dict(zip(header, r + [""] * (len(header) - len(r))))
+        if job.get("status", "").strip() != WANT_STATUS or job.get("resume_pdf", "").strip():
+            continue
+        m = re.match(FAILED_PREFIX + r"（第 (\d+) 次）", job.get("resume_changes", ""))
+        job["failures"] = int(m.group(1)) if m else 0
+        if job["failures"] < max_tries:
+            out.append(job)
+    return out
+
+
+def write_resume_result(book: gspread.Spreadsheet, key: str, values: dict) -> bool:
+    """Fill the resume columns of the row with this key (found again now, since rows
+    may have moved). Values starting with = are formulas, e.g. HYPERLINK."""
+    ws = book.worksheet(JOBS_TAB)
+    header = ws.row_values(1)
+    keys = ws.col_values(header.index("key") + 1)
+    if key not in keys:
+        return False
+    row = keys.index(key) + 1
+    cells = lambda formulas: [{"range": f"{_col_letter(header.index(c) + 1)}{row}", "values": [[v]]}
+                              for c, v in values.items() if c in header and str(v).startswith("=HYPERLINK(") == formulas]
+    # Links as formulas; text as-is, so "6/12 → 9/12" or a leading "-" isn't read as a date or formula.
+    if cells(True):
+        ws.batch_update(cells(True), value_input_option="USER_ENTERED")
+    if cells(False):
+        ws.batch_update(cells(False), value_input_option="RAW")
+    return True
 
 
 # ---------- jobs waiting to be scored ----------

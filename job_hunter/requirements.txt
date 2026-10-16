@@ -5,3 +5,5 @@ openpyxl
 pypdf
 pyyaml
 gspread>=6.0
+rendercv[full]==2.8  # tailored resume PDFs
+google-api-python-client  # uploads resumes to your Drive
