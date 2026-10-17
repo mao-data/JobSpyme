@@ -1,4 +1,5 @@
-"""Tailored one-page resumes (and cover letters) for jobs you mark 想投.
+"""Tailored one-page resumes (and cover letters) for jobs you mark 想投, and for
+new jobs that score high enough (resume.auto_min_score).
 
 Every fact comes from the experience bank (EXPERIENCE_BANK secret, or
 experience_bank.yaml next to this file). Claude picks, orders and rewords those
@@ -440,8 +441,11 @@ def _link(url: str, label: str) -> str:
 
 
 def make_resumes(book, cfg: dict, log, old_resume: str, today: str) -> None:
-    """Tailored resume + cover letter for each Jobs row whose status is 想投 and has
-    no resume yet. Links and a summary of the changes go into that row."""
+    """Tailored resume + cover letter for each Jobs row that is 想投, or new and scored
+    at least resume.auto_min_score, and has no resume yet. Links and a summary of the
+    changes go into that row."""
+    import pandas as pd
+
     import drive
     import sheets
     from llm import LLMError, make_llm
@@ -450,11 +454,16 @@ def make_resumes(book, cfg: dict, log, old_resume: str, today: str) -> None:
     if not rcfg.get("enabled", True):
         return
     max_tries = rcfg.get("max_tries", 3)
-    jobs = log.attempt("Google Sheet: read 想投 jobs", lambda: sheets.wanted_jobs(book, max_tries))
+    auto = rcfg.get("auto_min_score")
+    since = (pd.Timestamp(today) - pd.Timedelta(days=rcfg.get("auto_days", 3))).strftime("%Y-%m-%d")
+    jobs = log.attempt("Google Sheet: read jobs that need a resume",
+                       lambda: sheets.wanted_jobs(book, max_tries, auto, since))
     if not jobs:
-        print("Resumes: no 想投 jobs waiting for a resume")
+        print("Resumes: no jobs waiting for a resume")
         return
-    print(f"Resumes: {len(jobs)} 想投 job(s) need a tailored resume", flush=True)
+    n_auto = sum(j["auto"] for j in jobs)
+    print(f"Resumes: {len(jobs) - n_auto} marked 想投" + (f", {n_auto} scored {auto}+" if auto is not None else "")
+          + " need a tailored resume", flush=True)
     bank = load_bank()
     if not bank:
         log.warn("Resumes skipped: no experience bank (EXPERIENCE_BANK secret or experience_bank.yaml)")

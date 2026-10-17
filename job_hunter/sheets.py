@@ -125,8 +125,12 @@ def descriptions(book: gspread.Spreadsheet, keys: set[str]) -> dict[str, str]:
 FAILED_PREFIX = "產生失敗"
 
 
-def wanted_jobs(book: gspread.Spreadsheet, max_tries: int = 3) -> list[dict]:
-    """Jobs rows with status 想投 and no resume yet (and fewer than `max_tries` failures)."""
+def wanted_jobs(book: gspread.Spreadsheet, max_tries: int = 3, auto_min_score: float | None = None,
+                auto_since: str = "") -> list[dict]:
+    """Jobs rows that need a resume: status 想投, or (with `auto_min_score`) no status yet,
+    a score at least that high and found on or after `auto_since`. Rows that already
+    have a resume, or failed `max_tries` times, are skipped. 想投 rows come first,
+    then the highest scores."""
     ws = _tab(book, JOBS_TAB, JOBS_COLUMNS, True)
     rows = ws.get_all_values()
     if len(rows) < 2:
@@ -135,12 +139,23 @@ def wanted_jobs(book: gspread.Spreadsheet, max_tries: int = 3) -> list[dict]:
     out = []
     for r in rows[1:]:
         job = dict(zip(header, r + [""] * (len(header) - len(r))))
-        if job.get("status", "").strip() != WANT_STATUS or job.get("resume_pdf", "").strip():
+        if job.get("resume_pdf", "").strip():
+            continue
+        status = job.get("status", "").strip()
+        try:
+            score = float(job.get("fit_score") or "nan")
+        except ValueError:
+            score = float("nan")
+        job["auto"] = (status == "" and auto_min_score is not None and score >= auto_min_score
+                       and job.get("date_found", "") >= auto_since)
+        if status != WANT_STATUS and not job["auto"]:
             continue
         m = re.match(FAILED_PREFIX + r"（第 (\d+) 次）", job.get("resume_changes", ""))
         job["failures"] = int(m.group(1)) if m else 0
         if job["failures"] < max_tries:
+            job["_score"] = score if score == score else 0
             out.append(job)
+    out.sort(key=lambda j: (j["auto"], -j["_score"]))
     return out
 
 
