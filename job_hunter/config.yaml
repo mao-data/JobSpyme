@@ -89,10 +89,30 @@ claude:
   model: claude-opus-5-5
   # Jobs per Claude call when scoring. Fewer calls = less subscription usage.
   batch_size: 8
-  # Jobs scoring at least this (1-10) get a tailored cover letter + resume bullets.
-  tailor_min_score: 8
+  # Jobs scoring at least this (1-10) get a plain-text cover letter + resume bullets in
+  # the cover_letter column. Off (11): the resume step below makes a full resume and
+  # cover letter for 8+ jobs instead.
+  tailor_min_score: 11
   # Most jobs sent to Claude per run (newest first), to bound usage. Jobs past
   # the cap are still added to the sheet, unscored.
   max_jobs_scored: 300
   # Jobs Claude scores at or below this go to Filtered out instead of Jobs.
   drop_score_at_or_below: 3
+
+# Tailored resumes: made automatically for new jobs scoring auto_min_score or more,
+# and for any job whose status you set to 想投 in the Jobs tab (next run, or a manual
+# "resumes_only" run). Each gets a one-page resume PDF, an editable Google Doc and a
+# cover letter in your Drive, linked in that row.
+# Facts come only from the EXPERIENCE_BANK secret; see README.
+resume:
+  enabled: true
+  max_per_run: 10            # 想投 first, then the highest scores
+  auto_min_score: 8          # set to null to only make resumes for 想投
+  auto_days: 3               # only jobs found in the last N days get one automatically
+  # opus writes better; sonnet uses less of your subscription.
+  cli_model: opus
+  # Drafts per job that may fail the fact check before giving up on this run.
+  fact_check_tries: 3
+  # Runs that may fail for one job before it stops retrying (clear resume_changes to retry).
+  max_tries: 3
+  drive_folder: Job Hunter Resumes

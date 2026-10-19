@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import gspread
 import pandas as pd
@@ -23,8 +24,13 @@ JOBS_COLUMNS = [
     "date_found", "fit_score", "summary_zh", "title", "company", "location", "is_remote", "site",
     "date_posted", "salary", "ai_sponsorship", "sponsorship_evidence", "h1b_approvals",
     "years_required", "matched_skills", "missing_skills", "job_url", "job_url_direct",
-    "cover_letter", "status", "notes", "key",
+    "cover_letter", "status", "notes",
+    # Filled when you set status to 想投 (see resume.py)
+    "resume_pdf", "resume_doc", "cover_letter_doc", "resume_changes", "keyword_coverage",
+    "key",
 ]
+RESUME_COLUMNS = ["resume_pdf", "resume_doc", "cover_letter_doc", "resume_changes", "keyword_coverage"]
+WANT_STATUS = "想投"
 FILTERED_COLUMNS = ["date_found", "excluded_reason", "title", "company", "location", "site",
                     "visa_evidence", "job_url", "key"]
 
@@ -83,6 +89,95 @@ def known_keys(book: gspread.Spreadsheet) -> set[str]:
     return keys
 
 
+# ---------- job descriptions, kept for tailoring resumes ----------
+
+DESC_TAB = "_descriptions"
+DESC_COLUMNS = ["key", "description"]
+DESC_MAX = 15000
+
+
+def append_descriptions(book: gspread.Spreadsheet, df: pd.DataFrame) -> bool:
+    """Save the posting text of jobs added to Jobs, so a resume can be tailored to it
+    later. A hidden tab: the Jobs tab stays readable."""
+    if df.empty or "description" not in df:
+        return True
+    new = DESC_TAB not in {w.title for w in book.worksheets()}
+    ws = _tab(book, DESC_TAB, DESC_COLUMNS)
+    if new:
+        book.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
+    rows = [[r["key"], str(r["description"])[:DESC_MAX]] for _, r in df.iterrows()
+            if isinstance(r.get("description"), str) and r["description"].strip()]
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
+    return True
+
+
+def descriptions(book: gspread.Spreadsheet, keys: set[str]) -> dict[str, str]:
+    ws = {w.title: w for w in book.worksheets()}.get(DESC_TAB)
+    if ws is None:
+        return {}
+    return {r[0]: r[1] for r in ws.get_all_values()[1:] if len(r) > 1 and r[0] in keys}
+
+
+# ---------- jobs you marked 想投 ----------
+
+FAILED_PREFIX = "產生失敗"
+
+
+def wanted_jobs(book: gspread.Spreadsheet, max_tries: int = 3, auto_min_score: float | None = None,
+                auto_since: str = "") -> list[dict]:
+    """Jobs rows that need a resume: status 想投, or (with `auto_min_score`) no status yet,
+    a score at least that high and found on or after `auto_since`. Rows that already
+    have a resume, or failed `max_tries` times, are skipped. 想投 rows come first,
+    then the highest scores."""
+    ws = _tab(book, JOBS_TAB, JOBS_COLUMNS, True)
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return []
+    header = rows[0]
+    out = []
+    for r in rows[1:]:
+        job = dict(zip(header, r + [""] * (len(header) - len(r))))
+        if job.get("resume_pdf", "").strip():
+            continue
+        status = job.get("status", "").strip()
+        try:
+            score = float(job.get("fit_score") or "nan")
+        except ValueError:
+            score = float("nan")
+        job["auto"] = (status == "" and auto_min_score is not None and score >= auto_min_score
+                       and job.get("date_found", "") >= auto_since)
+        if status != WANT_STATUS and not job["auto"]:
+            continue
+        m = re.match(FAILED_PREFIX + r"（第 (\d+) 次）", job.get("resume_changes", ""))
+        job["failures"] = int(m.group(1)) if m else 0
+        if job["failures"] < max_tries:
+            job["_score"] = score if score == score else 0
+            out.append(job)
+    out.sort(key=lambda j: (j["auto"], -j["_score"]))
+    return out
+
+
+def write_resume_result(book: gspread.Spreadsheet, key: str, values: dict) -> bool:
+    """Fill the resume columns of the row with this key (found again now, since rows
+    may have moved). Values starting with = are formulas, e.g. HYPERLINK."""
+    ws = book.worksheet(JOBS_TAB)
+    header = ws.row_values(1)
+    keys = ws.col_values(header.index("key") + 1)
+    if key not in keys:
+        return False
+    row = keys.index(key) + 1
+    cells = lambda formulas: [{"range": f"{_col_letter(header.index(c) + 1)}{row}", "values": [[v]]}
+                              for c, v in values.items() if c in header and str(v).startswith("=HYPERLINK(") == formulas]
+    # Links as formulas; text as-is, so "6/12 → 9/12" or a leading "-" isn't read as a date or formula.
+    if cells(True):
+        ws.batch_update(cells(True), value_input_option="USER_ENTERED")
+    if cells(False):
+        ws.batch_update(cells(False), value_input_option="RAW")
+    return True
+
+
 # ---------- jobs waiting to be scored ----------
 
 PENDING_COLUMNS = [
@@ -133,8 +228,10 @@ def keys_in(book: gspread.Spreadsheet, title: str) -> set[str]:
 
 
 def _cell(v):
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
+    # None (JSON null) leaves the cell truly empty. An empty string would be stored as
+    # text, which the sheet sorts above every number and counts as >= any score.
+    if v is None or (isinstance(v, float) and pd.isna(v)) or v is pd.NA or v == "":
+        return None
     if hasattr(v, "item"):  # numpy scalar -> plain Python, so JSON can carry it
         v = v.item()
     if isinstance(v, float) and v.is_integer():
@@ -265,23 +362,53 @@ PICKS_COLUMNS = ["fit_score", "summary_zh", "title", "company", "location", "sal
 
 
 def ensure_picks_tab(book: gspread.Spreadsheet, min_score: int, days: int) -> None:
-    """A tab whose formula lists recent, high-scoring jobs with no status yet.
-    Created once; it updates itself as rows are added or given a status."""
-    if PICKS_TAB in {ws.title for ws in book.worksheets()}:
-        return
+    """A tab whose formula lists recent, high-scoring jobs with no status yet. The
+    formula is rewritten each run, so changes to it reach an existing tab; the tab
+    then updates itself as rows are added or given a status."""
     header = book.worksheet(JOBS_TAB).row_values(1)
     col = {c: f"{JOBS_TAB}!{_col_letter(header.index(c) + 1)}2:{_col_letter(header.index(c) + 1)}"
            for c in PICKS_COLUMNS + ["status"]}
     columns = ", ".join(col[c] for c in PICKS_COLUMNS)
+    score = col["fit_score"]
     formula = (
         f'=IFERROR(SORT(FILTER({{{columns}}}, '
-        f'{col["fit_score"]}>={min_score}, {col["status"]}="", '
+        f'ISNUMBER({score}), {score}>={min_score}, {col["status"]}="", '
         f'{col["date_found"]}>=TEXT(TODAY()-{days},"yyyy-mm-dd")), 1, FALSE), '
         f'"目前沒有符合條件的職缺")'
     )
-    ws = book.add_worksheet(title=PICKS_TAB, rows=500, cols=len(PICKS_COLUMNS), index=0)
+    if PICKS_TAB in {ws.title for ws in book.worksheets()}:
+        ws = book.worksheet(PICKS_TAB)
+    else:
+        ws = book.add_worksheet(title=PICKS_TAB, rows=500, cols=len(PICKS_COLUMNS), index=0)
+        ws.freeze(rows=1)
     ws.update(range_name="A1", values=[PICKS_COLUMNS, [formula]], value_input_option="USER_ENTERED")
-    ws.freeze(rows=1)
+
+
+def clean_scores(book: gspread.Spreadsheet) -> None:
+    """Make every fit_score in Jobs a number or a truly empty cell. Earlier runs wrote
+    missing scores as empty text, which sorted above real scores and slipped into
+    今日精選; this repairs those rows in place."""
+    ws = book.worksheet(JOBS_TAB)
+    header = ws.row_values(1)
+    if "fit_score" not in header:
+        return
+    c = header.index("fit_score")
+    values = ws.col_values(c + 1)[1:]
+    if not values:
+        return
+    cells = []
+    for v in values:
+        try:
+            cells.append({"userEnteredValue": {"numberValue": float(v)}})
+        except ValueError:
+            # Not a number (empty, or text): clear it. Only blank-looking cells get here.
+            cells.append({"userEnteredValue": {"stringValue": v}} if v.strip() else {})
+    book.batch_update({"requests": [{"updateCells": {
+        "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": 1 + len(cells),
+                  "startColumnIndex": c, "endColumnIndex": c + 1},
+        "rows": [{"values": [cell]} for cell in cells],
+        "fields": "userEnteredValue",
+    }}]})
 
 
 def archive_old(book: gspread.Spreadsheet, today: str, days: int) -> int:
@@ -336,6 +463,7 @@ def sort_newest_first(book: gspread.Spreadsheet) -> None:
 def tidy(book: gspread.Spreadsheet, today: str, cfg: dict, warn=print) -> None:
     """Optional sheet niceties. A failure here is reported but never stops the run."""
     steps = [
+        ("clean empty scores", lambda: clean_scores(book)),
         ("status dropdown and colours", lambda: setup_jobs_tab(book)),
         ("today's picks tab", lambda: ensure_picks_tab(book, cfg.get("picks_min_score", 7), cfg.get("picks_days", 3))),
         ("archive", lambda: print(f"Archived {archive_old(book, today, cfg.get('archive_after_days', 14))} old rows")),
